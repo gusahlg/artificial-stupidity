@@ -1,16 +1,24 @@
 use crate::memory::{load};
+use crate::teacher::{weight_change};
 use rand::Rng;
 use std::collections::HashSet;
-const NUMBER_OF_LAYERS: usize = 100;
+const NUMBER_OF_LAYERS: usize = 250;
 
 fn sigmoid(x: f32) -> f32 {
     let exponent = (-x).exp(); // e^(-x)
     let denominator = 1.0 + exponent;
     return 1.0 / denominator;
 }
-struct Layer {
-    Weights: Vec<Vec<f32>>,
-    Biases: Vec<f32>,
+pub struct NeuronCache {
+    pub(crate) Activation: f32,
+    pub(crate) PreActivation: f32,
+}
+pub(crate) struct Layer {
+     pub(crate)Weights: Vec<Vec<f32>>,
+    pub(crate)Biases: Vec<f32>,
+
+    pub(crate)Cache: Vec<NeuronCache>,
+    pub(crate)LastInput: Vec<f32>,
 }
 impl Layer {
     fn forward(&self, input: &[f32]) -> Vec<f32> {
@@ -20,13 +28,31 @@ impl Layer {
             for i in 0..input.len() {
                 sum += input[i] * self.Weights[neuron_index][i];
             }
-        outputs.push(sigmoid(sum));
+            outputs.push(sigmoid(sum));
         }
         outputs
     }
+    fn forward_and_cache(&mut self, input: &[f32]) -> Vec<f32> {
+    self.Cache.clear();
+    self.LastInput.clear();
+    self.LastInput.extend_from_slice(input);
+
+    let mut outputs = Vec::with_capacity(self.Biases.len());
+    for neuron_index in 0..self.Biases.len() {
+        let mut sum = self.Biases[neuron_index];
+        for i in 0..input.len() {
+            sum += input[i] * self.Weights[neuron_index][i];
+        }
+
+        let a = sigmoid(sum);
+        outputs.push(a);
+        self.Cache.push(NeuronCache { Activation: a, PreActivation: sum });
+    }
+    outputs
+}
 }
 pub struct Network {
-    Layers: Vec<Layer>,
+    pub(crate) Layers: Vec<Layer>,
 }
 impl Network {
     pub fn forward(&self, mut input: Vec<f32>) -> Vec<f32> {
@@ -35,6 +61,35 @@ impl Network {
         }
         input
     }
+    pub fn forward_and_cache(&mut self, mut input: Vec<f32>) -> Vec<f32> {
+    for layer in &mut self.Layers {
+        input = layer.forward_and_cache(&input);
+    }
+    input
+}
+
+pub fn adjust_weights(&mut self, deltas: &[Vec<f32>], lr: f32) {
+    for l in 0..self.Layers.len() {
+        let input = self.Layers[l].LastInput.clone();
+
+        for j in 0..self.Layers[l].Biases.len() {
+            let delta = deltas[l][j];
+            self.Layers[l].Biases[j] -= lr * delta;
+
+            for i in 0..input.len() {
+                self.Layers[l].Weights[j][i] -= lr * delta * input[i];
+            }
+        }
+    }
+}
+
+pub fn train_one(&mut self, features: Vec<f32>, target_index: usize, lr: f32, strength: f32) {
+    self.forward_and_cache(features);
+    let deltas = weight_change(self, target_index, strength);
+    self.adjust_weights(&deltas, lr);
+}
+}
+
 }
 fn interpret_input(input: &str, memory: &Vec<String>) -> Vec<f32> {
     let input_text: String = memory.join(" ") + " " + input;
@@ -42,18 +97,14 @@ fn interpret_input(input: &str, memory: &Vec<String>) -> Vec<f32> {
     let word_count = input_text.split_whitespace().count();
     let words: Vec<&str> = input_text.split_whitespace().collect();
 
-    // Feature 1: average word length
     let avg = words.iter().map(|w| w.len()).sum::<usize>() as f32 / words.len() as f32;
     let f1 = (avg / 10.0).min(1.0);
 
-    // Feature 2: number of words (roughly spaces + 1), scaled
     let f2 = (word_count as f32 / 50.0).min(1.0);
 
-    // Feature 3: punctuation amount (e.g. question marks)
     let question_marks = input_text.chars().filter(|&c| c == '?').count();
     let f3 = (question_marks as f32 / 5.0).min(1.0);
 
-    // Feature 4: vowel to consonant ratio
     let vowels = "aeiou";
     let mut v = 0;
     let mut c = 0;
@@ -64,7 +115,6 @@ fn interpret_input(input: &str, memory: &Vec<String>) -> Vec<f32> {
     let ratio = v as f32 / c as f32;
     let f4 = (ratio / 5.0).min(1.0);
 
-    // Feature 5: number of common letters
     let mut score = 0;
     for ch in input_text.to_lowercase().chars(){
         if ch == 'e' {score+=10}
@@ -78,39 +128,60 @@ fn interpret_input(input: &str, memory: &Vec<String>) -> Vec<f32> {
     }
     let f5 = score as f32 / 5.0;
 
-    // Feature 6: letter diversity
     let len = input_text.len() as f32;
     let uniq = input_text.chars().collect::<HashSet<char>>().len() as f32;
     let f6 = uniq / len;
 
-    // Feature 7: 
-    // Feature 8: 
-    // Feature 9: 
-    // Feature 10: 
     vec![f1, f2, f3, f4, f5, f6/*, f7, f8, f9, f10*/]
 }
 
 pub fn network_init(hidden_size: usize, output_size: usize) -> Network {
-    let layers: Vec<Layer> = Vec::new();
-    let mut neural_network: Network = Network{Layers: layers};
+    let mut rng = rand::thread_rng();
 
-    for _ in 0..NUMBER_OF_LAYERS {
-        let hidden_weights: Vec<Vec<f32>> = (0..hidden_size).map(|_| Vec::new()).collect();
-        let hidden_biases: Vec<f32> = vec!(0.0f32; hidden_size);
+    let input_size: usize = 6;
 
-        neural_network.Layers.push(
-            Layer{ Weights: hidden_weights, Biases: hidden_biases, }
-        );
+    let mut neural_network = Network { Layers: Vec::new() };
+
+    let w0: Vec<Vec<f32>> = (0..hidden_size)
+        .map(|_| {
+            (0..input_size)
+                .map(|_| rng.gen_range(-1.0..1.0))
+                .collect()
+        })
+        .collect();
+    let b0: Vec<f32> = vec![0.0; hidden_size];
+    neural_network.Layers.push(Layer { Cache: Vec::with_capacity(hidden_size), LastInput: Vec::new(), Weights: w0, Biases: b0 });
+
+    for _ in 1..NUMBER_OF_LAYERS {
+        let w: Vec<Vec<f32>> = (0..hidden_size)
+            .map(|_| {
+                (0..hidden_size)
+                    .map(|_| rng.gen_range(-1.0..1.0))
+                    .collect()
+            })
+            .collect();
+        let b: Vec<f32> = vec![0.0; hidden_size];
+        neural_network.Layers.push(Layer { Cache: Vec::with_capacity(output_size), LastInput: Vec::new(), Weights: w, Biases: b });
     }
-    let output_weights: Vec<Vec<f32>> =  (0..output_size).map(|_| Vec::new()).collect();
-    let output_biases: Vec<f32> = vec!(0.0f32; output_size);
-    neural_network.Layers.push(Layer{Weights: output_weights, Biases: output_biases,});
+
+    let w_out: Vec<Vec<f32>> = (0..output_size)
+        .map(|_| {
+            (0..hidden_size)
+                .map(|_| rng.gen_range(-1.0..1.0))
+                .collect()
+        })
+        .collect();
+    let b_out: Vec<f32> = vec![0.0; output_size];
+    neural_network.Layers.push(Layer { Cache: Vec::new(), LastInput: Vec::new(), Weights: w_out, Biases: b_out });
+
     neural_network
 }
+
 struct VocabPair {
     activation: f32,
     word: String,
 }
+
 fn interpret_output(activations: Vec<f32>, words: &Vec<String>) -> String{
     // Pair all output neuron activations with words
     let mut pairs: Vec<VocabPair> = Vec::with_capacity(activations.len());
@@ -130,10 +201,8 @@ fn interpret_output(activations: Vec<f32>, words: &Vec<String>) -> String{
     pairs[idx].word.clone()
 }
 
-pub fn generate(net: &Network, start: &str, memory: &Vec<String>) -> String {
+pub fn generate(net: &Network, start: &str, memory: &Vec<String>, words: Vec<String>) -> String {
     let mut text = start.to_string();
-    
-    let words = load();
     for _ in 0..100 {
         let features = interpret_input(&text, &memory);
         let activations = net.forward(features);

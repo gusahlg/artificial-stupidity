@@ -12,10 +12,11 @@ fn main(){
     let mut talking = true;
     let mut bot_memory: Vec<String> = Vec::new();
     println!("Hey, welcome to SuperSighurt LLM-mode!");
-     
+    let words_in_vocab = memory::load();
+
     // let input_size: usize = 6;
-    let hidden_size: usize = 750;
-    let output_size: usize = memory::load().len();
+    let hidden_size: usize = 1500;
+    let output_size: usize = words_in_vocab.len();
     let net = network_init(hidden_size, output_size);
     while talking {
         if !output.trim().is_empty() {
@@ -37,7 +38,7 @@ fn main(){
                 continue;
             }
 
-            let sentence = generate(&net, &input, &bot_memory);
+            let sentence = generate(&net, &input, &bot_memory, words_in_vocab);
             output = sentence;
         }
     }
