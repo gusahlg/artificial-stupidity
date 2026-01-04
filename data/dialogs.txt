@@ -1,5 +1,5 @@
 <SEC>
-<USER> Hey there. </USER>
+<USER> Hey there! </USER>
 <BOT> Hello! How can I assist today? </BOT>
 
 <USER> I’m just testing a dialog format. </USER>

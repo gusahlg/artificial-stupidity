@@ -4,24 +4,23 @@
 // match each of the LLM's words in its next response with the words in the teacher response.
 use crate::dialogs::{Data, Text};
 // For now arbitrary way of determining how much two words resemble each other
-fn string_similarity(word1: &str, word2: &str) -> u8 {
-    let a = word1;
-    let b = word2;
-
+pub fn string_similarity(word1: &str, word2: &str) -> u8 {
     let mut result: u8 = 0;
-    if a == b { return 100; }
+    if word1 == word2 { return 100; }
     
     let mut len_diff: u8 = 0;
-    if a.len() > b.len() { len_diff = a.len() as u8 - b.len() as u8; }
+    if word1.len() > word2.len() {
+        len_diff = (word1.len() - word2.len()) as u8;
+    }
     result += len_diff; 
 
-    for (ca, cb) in a.chars().zip(b.chars()) {
-        if ca == cb { result += 1; }
+    for (cword1, cword2) in word1.chars().zip(word2.chars()) {
+        if cword1 == cword2 { result += 1; }
     }
 
     result
 }
-fn index_of_most_similar_section(sections: &Vec<Vec<Text>>, memory: &Vec<&str>) -> usize {
+fn index_of_most_similar_section(sections: &Vec<Vec<Text>>, memory: &Vec<String>) -> usize {
     let mut scores: Vec<(u8, usize)> = Vec::with_capacity(sections.len());
 
     for (section_index, section) in sections.iter().enumerate() {
@@ -50,7 +49,7 @@ fn index_of_most_similar_section(sections: &Vec<Vec<Text>>, memory: &Vec<&str>) 
         }
 
         //scores[section_index] = (section_score, section_index);
-        scores.push(section_score, section_index);
+        scores.push((section_score, section_index));
     }
     
     // Go through all scores and find the one with the highest, 
@@ -61,8 +60,8 @@ fn index_of_most_similar_section(sections: &Vec<Vec<Text>>, memory: &Vec<&str>) 
     }
     idx_of_highest 
 }
-pub fn teacher_response(dialog: &Data, bot_memory: &Vec<&str>, user_input: &str) -> String {
-    let index = index_of_most_similar_section(&dialog.Sections, &bot_memory);
+pub fn teacher_response(dialog: &Data, bot_memory: &Vec<String>, user_input: &str) -> String {
+    let index = index_of_most_similar_section(&dialog.Sections, bot_memory);
     let section: Vec<Text> = dialog.Sections[index].clone();
 
     // I want to check what question by the user inside of the chosen section best matches the

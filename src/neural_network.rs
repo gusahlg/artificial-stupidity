@@ -1,8 +1,9 @@
-use crate::memory::{load};
-use crate::teacher::{weight_change};
+use crate::dialogs::{Data};
+use crate::teacher::{word_change_delta};
+use crate::machine_learning::{teacher_response};
 use rand::Rng;
 use std::collections::HashSet;
-const NUMBER_OF_LAYERS: usize = 250;
+const NUMBER_OF_LAYERS: usize = 500;
 
 fn sigmoid(x: f32) -> f32 {
     let exponent = (-x).exp(); // e^(-x)
@@ -33,23 +34,23 @@ impl Layer {
         outputs
     }
     fn forward_and_cache(&mut self, input: &[f32]) -> Vec<f32> {
-    self.Cache.clear();
-    self.LastInput.clear();
-    self.LastInput.extend_from_slice(input);
+        self.Cache.clear();
+        self.LastInput.clear();
+        self.LastInput.extend_from_slice(input);
 
-    let mut outputs = Vec::with_capacity(self.Biases.len());
-    for neuron_index in 0..self.Biases.len() {
-        let mut sum = self.Biases[neuron_index];
-        for i in 0..input.len() {
-            sum += input[i] * self.Weights[neuron_index][i];
+        let mut outputs = Vec::with_capacity(self.Biases.len());
+        for neuron_index in 0..self.Biases.len() {
+            let mut sum = self.Biases[neuron_index];
+            for i in 0..input.len() {
+                sum += input[i] * self.Weights[neuron_index][i];
+            }
+
+            let a = sigmoid(sum);
+            outputs.push(a);
+            self.Cache.push(NeuronCache { Activation: a, PreActivation: sum });
         }
-
-        let a = sigmoid(sum);
-        outputs.push(a);
-        self.Cache.push(NeuronCache { Activation: a, PreActivation: sum });
+        outputs
     }
-    outputs
-}
 }
 pub struct Network {
     pub(crate) Layers: Vec<Layer>,
@@ -62,35 +63,30 @@ impl Network {
         input
     }
     pub fn forward_and_cache(&mut self, mut input: Vec<f32>) -> Vec<f32> {
-    for layer in &mut self.Layers {
-        input = layer.forward_and_cache(&input);
+        for layer in &mut self.Layers {
+            input = layer.forward_and_cache(&input);
+        }
+        input
     }
-    input
-}
 
-pub fn adjust_weights(&mut self, deltas: &[Vec<f32>], lr: f32) {
-    for l in 0..self.Layers.len() {
-        let input = self.Layers[l].LastInput.clone();
+    fn update_neuron_sgd(weights_j: &mut [f32], bias_j: &mut f32, prev_acts: &[f32], delta_j: f32, lr: f32) {
+        *bias_j -= lr * delta_j;
+        for (w, &a_prev) in weights_j.iter_mut().zip(prev_acts.iter()) {
+            *w -= lr * delta_j * a_prev;
+        }
+    }
 
-        for j in 0..self.Layers[l].Biases.len() {
-            let delta = deltas[l][j];
-            self.Layers[l].Biases[j] -= lr * delta;
-
-            for i in 0..input.len() {
-                self.Layers[l].Weights[j][i] -= lr * delta * input[i];
+    pub fn adjust_weights(&mut self, lr: f32, teacher_response: String, word: String) {
+        let layer_deltas = word_change_delta(&word, &teacher_response, self);
+        for (layer_idx, layer) in self.Layers.iter_mut().enumerate() {
+            for neuron in 0..layer.Biases.len() {
+                let n_delta = layer_deltas[layer_idx][neuron];
+                Network::update_neuron_sgd(&mut layer.Weights[neuron], &mut layer.Biases[neuron], &layer.LastInput, n_delta, lr); 
             }
         }
     }
 }
 
-pub fn train_one(&mut self, features: Vec<f32>, target_index: usize, lr: f32, strength: f32) {
-    self.forward_and_cache(features);
-    let deltas = weight_change(self, target_index, strength);
-    self.adjust_weights(&deltas, lr);
-}
-}
-
-}
 fn interpret_input(input: &str, memory: &Vec<String>) -> Vec<f32> {
     let input_text: String = memory.join(" ") + " " + input;
 
@@ -161,7 +157,7 @@ pub fn network_init(hidden_size: usize, output_size: usize) -> Network {
             })
             .collect();
         let b: Vec<f32> = vec![0.0; hidden_size];
-        neural_network.Layers.push(Layer { Cache: Vec::with_capacity(output_size), LastInput: Vec::new(), Weights: w, Biases: b });
+        neural_network.Layers.push(Layer { Cache: Vec::with_capacity(hidden_size), LastInput: Vec::new(), Weights: w, Biases: b });
     }
 
     let w_out: Vec<Vec<f32>> = (0..output_size)
@@ -204,10 +200,16 @@ fn interpret_output(activations: Vec<f32>, words: &Vec<String>) -> String{
 pub fn generate(net: &Network, start: &str, memory: &Vec<String>, words: Vec<String>) -> String {
     let mut text = start.to_string();
     for _ in 0..100 {
+        // 1. Make text into input for network
+        // 2. Let the network do the thinking
+        // 3. Convert output into a word
+
         let features = interpret_input(&text, &memory);
         let activations = net.forward(features);
         let next_word = interpret_output(activations, &words);
         
+        // 4. Look at how good the word matches with the corresponding word in the teacher response
+        //    and then adjust neurons in network accordingly.
         text.push(' ');
         text.push_str(&next_word);
     }
@@ -215,5 +217,33 @@ pub fn generate(net: &Network, start: &str, memory: &Vec<String>, words: Vec<Str
     let len = start.to_string().len();
     text[len..].to_string()
 }
+pub fn generate_and_train(net: &mut Network, start: &str, memory: &Vec<String>, words: Vec<String>, data: &Data, lr: f32) -> String {
+    let mut text = start.to_string();
+    let teacher: Vec<String> =
+    teacher_response(data, memory, start)
+        .split_whitespace()
+        .map(|w| w.to_string())
+        .collect();
 
+    for i in 0..100 {
+        let features = interpret_input(&text, &memory);
+        let activations = net.forward_and_cache(features);
+        let next_word = interpret_output(activations, &words);
+        
+        let teacher_word = match teacher.get(i) {
+            Some(s) => s.clone(),
+            None => {
+                text.push(' ');
+                text.push_str(&next_word);
+                let len = start.to_string().len();
+                return text[len..].to_string();
+            },
+        };
+        net.adjust_weights(lr, teacher_word, next_word.clone());
+        text.push(' ');
+        text.push_str(&next_word);
+    }
 
+    let len = start.to_string().len();
+    text[len..].to_string()
+}

@@ -2,11 +2,15 @@ mod memory;
 mod neural_network;
 mod machine_learning;
 mod dialogs;
-use crate::neural_network::{network_init, generate};
+mod teacher;
+use crate::neural_network::{network_init, generate, generate_and_train};
 use crate::memory::{append};
 use std::io::{self, Write};
+use crate::dialogs::{Data};
+use std::time::Instant;
 
 fn main(){
+    let train: bool = true;
     let mut output = String::new();
     let mut input = String::new();
     let mut talking = true;
@@ -17,7 +21,10 @@ fn main(){
     // let input_size: usize = 6;
     let hidden_size: usize = 1500;
     let output_size: usize = words_in_vocab.len();
-    let net = network_init(hidden_size, output_size);
+    let mut net = network_init(hidden_size, output_size);
+    let mut dialog: Data = Data::new();
+    dialog.load();
+    let lr = 10f32;
     while talking {
         if !output.trim().is_empty() {
             println!("Sighurt: {}", output);
@@ -37,8 +44,17 @@ fn main(){
                 talking = false;
                 continue;
             }
+            let mut sentence: String = String::new();
 
-            let sentence = generate(&net, &input, &bot_memory, words_in_vocab);
+            // Performance data gatherer:
+            let start = Instant::now();
+            if train {
+                sentence = generate_and_train(&mut net, &input, &bot_memory, words_in_vocab.clone(), &dialog, lr);
+            }
+            else {
+                sentence = generate(&net, &input, &bot_memory, words_in_vocab.clone());
+            }
+            println!("Time to get answer in seconds: {:?}", start.elapsed().as_secs());
             output = sentence;
         }
     }
