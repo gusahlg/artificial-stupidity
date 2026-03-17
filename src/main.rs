@@ -1,4 +1,5 @@
 mod memory;
+mod embeddings;
 mod neural_network;
 mod machine_learning;
 mod dialogs;
@@ -19,12 +20,12 @@ fn main(){
     let words_in_vocab = memory::load();
 
     // let input_size: usize = 6;
-    let hidden_size: usize = 1500;
+    let hidden_size: usize = 5000;
     let output_size: usize = words_in_vocab.len();
     let mut net = network_init(hidden_size, output_size);
     let mut dialog: Data = Data::new();
     dialog.load();
-    let lr = 10f32;
+    let lr = 0.1;
     while talking {
         if !output.trim().is_empty() {
             println!("Sighurt: {}", output);
@@ -54,7 +55,7 @@ fn main(){
             else {
                 sentence = generate(&net, &input, &bot_memory, words_in_vocab.clone());
             }
-            println!("Time to get answer in seconds: {:?}", start.elapsed().as_secs());
+            println!("Time to get answer in seconds: {:?}", start.elapsed().as_secs_f64());
             output = sentence;
         }
     }

@@ -3,7 +3,7 @@ use crate::teacher::{word_change_delta};
 use crate::machine_learning::{teacher_response};
 use rand::Rng;
 use std::collections::HashSet;
-const NUMBER_OF_LAYERS: usize = 500;
+const NUMBER_OF_LAYERS: usize = 10;
 
 fn sigmoid(x: f32) -> f32 {
     let exponent = (-x).exp(); // e^(-x)
@@ -76,8 +76,8 @@ impl Network {
         }
     }
 
-    pub fn adjust_weights(&mut self, lr: f32, teacher_response: String, word: String) {
-        let layer_deltas = word_change_delta(&word, &teacher_response, self);
+    pub fn adjust_weights(&mut self, lr: f32, teacher_response: String, word_pair: WordIndexPair, vocab: &Vec<String>) {
+        let layer_deltas = word_change_delta(&word_pair, &teacher_response, vocab, self);
         for (layer_idx, layer) in self.Layers.iter_mut().enumerate() {
             for neuron in 0..layer.Biases.len() {
                 let n_delta = layer_deltas[layer_idx][neuron];
@@ -178,7 +178,13 @@ struct VocabPair {
     word: String,
 }
 
-fn interpret_output(activations: Vec<f32>, words: &Vec<String>) -> String{
+#[derive(Clone)]
+pub struct WordIndexPair {
+    idx: usize,
+    word: String,
+}
+
+fn interpret_output(activations: Vec<f32>, words: &Vec<String>) -> WordIndexPair {
     // Pair all output neuron activations with words
     let mut pairs: Vec<VocabPair> = Vec::with_capacity(activations.len());
     pairs.retain(|p| !p.activation.is_nan());
@@ -194,7 +200,11 @@ fn interpret_output(activations: Vec<f32>, words: &Vec<String>) -> String{
     let choices = 3;
     
     let idx = rand::thread_rng().gen_range(0..choices);
-    pairs[idx].word.clone()
+    let pair = WordIndexPair {
+        idx: idx,
+        word: pairs.swap_remove(idx).word,
+    };
+    pair
 }
 
 pub fn generate(net: &Network, start: &str, memory: &Vec<String>, words: Vec<String>) -> String {
@@ -211,12 +221,13 @@ pub fn generate(net: &Network, start: &str, memory: &Vec<String>, words: Vec<Str
         // 4. Look at how good the word matches with the corresponding word in the teacher response
         //    and then adjust neurons in network accordingly.
         text.push(' ');
-        text.push_str(&next_word);
+        text.push_str(&next_word.word);
     }
 
     let len = start.to_string().len();
     text[len..].to_string()
 }
+// I need to get the index of the next_word to adjust output layer correctly
 pub fn generate_and_train(net: &mut Network, start: &str, memory: &Vec<String>, words: Vec<String>, data: &Data, lr: f32) -> String {
     let mut text = start.to_string();
     let teacher: Vec<String> =
@@ -228,20 +239,20 @@ pub fn generate_and_train(net: &mut Network, start: &str, memory: &Vec<String>, 
     for i in 0..100 {
         let features = interpret_input(&text, &memory);
         let activations = net.forward_and_cache(features);
-        let next_word = interpret_output(activations, &words);
+        let next_word_pair = interpret_output(activations, &words);
         
         let teacher_word = match teacher.get(i) {
             Some(s) => s.clone(),
             None => {
                 text.push(' ');
-                text.push_str(&next_word);
+                text.push_str(&next_word_pair.word);
                 let len = start.to_string().len();
                 return text[len..].to_string();
             },
         };
-        net.adjust_weights(lr, teacher_word, next_word.clone());
+        net.adjust_weights(lr, teacher_word, next_word_pair.clone(), &words);
         text.push(' ');
-        text.push_str(&next_word);
+        text.push_str(&next_word_pair.word);
     }
 
     let len = start.to_string().len();

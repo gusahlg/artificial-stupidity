@@ -1,5 +1,4 @@
-use crate::neural_network::Network;
-use crate::machine_learning::{string_similarity};
+use crate::neural_network::{Network, WordIndexPair};
 fn output_delta_sigmoid(error: f32, activation: f32) -> f32 {
     // sigmoid'(z) can be computed from activation: a * (1 - a)
     let slope = activation * (1.0 - activation);
@@ -15,38 +14,7 @@ fn hidden_delta_sigmoid(hidden_activation: f32, neuron_j: usize, next_layer_weig
     weighted_sum * slope
 }
 
-/*
-pub fn word_change_delta(word: &str, teacher_word: &str, net: &Network) -> Vec<Vec<f32>> {
-    // Turn loss into responsibility
-    let mut net_change: Vec<Vec<f32>> = Vec::with_capacity(net.Layers.len());
-    for (layer_idx, layer) in net.Layers.iter().enumerate() {
-        net_change.push(Vec::new());
-        if layer_idx == net.Layers.len()-1 {
-            for n_cache in &layer.Cache {
-                let loss = -(0.000000001f32 + (string_similarity(word, teacher_word) as f32)).ln();
-                net_change[layer_idx].push(output_delta_sigmoid(loss, n_cache.Activation));
-            }
-        }
-        else {
-            for n_cache in &layer.Cache {
-                let loss = -(0.000000001f32 + (string_similarity(word, teacher_word) as f32)).ln();
-
-                let j = net_change[layer_idx].len();
-                let delta = hidden_delta_sigmoid(
-                    n_cache.Activation,
-                    j,
-                    &net.Layers[layer_idx + 1].Weights,
-                    &net_change[layer_idx + 1],
-                );
-
-                net_change[layer_idx].push(delta);
-            }
-        }
-    } 
-    net_change
-}
-*/
-pub fn word_change_delta(word: &str, teacher_word: &str, net: &Network) -> Vec<Vec<f32>> {
+pub fn word_change_delta(word_and_index: &WordIndexPair, teacher_word: &str, vocab: &Vec<String>, net: &Network) -> Vec<Vec<f32>> {
     let lcount = net.Layers.len();
 
     // Pre-allocate deltas for each layer
@@ -56,11 +24,23 @@ pub fn word_change_delta(word: &str, teacher_word: &str, net: &Network) -> Vec<V
         .map(|layer| vec![0.0f32; layer.Cache.len()])
         .collect();
 
-    // 1) Output layer first
+    // Find the index of the teacher word in vocabulary
+    let teacher_word_idx = vocab
+        .iter()
+        .position(|w| w == teacher_word)
+        .unwrap();
+
+    // Output layer: set target for each neuron
     let out = lcount - 1;
     for (i, n_cache) in net.Layers[out].Cache.iter().enumerate() {
-        let loss = -(0.000000001f32 + (string_similarity(word, teacher_word) as f32)).ln();
-        deltas[out][i] = output_delta_sigmoid(loss, n_cache.Activation);
+        let target = if i == teacher_word_idx {
+            1.0  // Correct word - should fire
+        } else {
+            0.0  // Wrong word - should not fire
+        };
+
+        let error = target - n_cache.Activation;
+        deltas[out][i] = output_delta_sigmoid(error, n_cache.Activation);
     }
 
     // 2) Hidden layers backwards, using split_at_mut to avoid borrow conflict
