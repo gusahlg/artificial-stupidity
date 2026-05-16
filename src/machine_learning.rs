@@ -20,7 +20,7 @@ pub fn string_similarity(word1: &str, word2: &str) -> u8 {
 
     result
 }
-fn index_of_most_similar_section(sections: &Vec<Vec<Text>>, memory: &Vec<String>) -> usize {
+fn index_of_most_similar_section(sections: &[Vec<Text>], memory: &[String]) -> usize {
     let mut scores: Vec<(u8, usize)> = Vec::with_capacity(sections.len());
 
     for (section_index, section) in sections.iter().enumerate() {
@@ -60,29 +60,36 @@ fn index_of_most_similar_section(sections: &Vec<Vec<Text>>, memory: &Vec<String>
     }
     idx_of_highest 
 }
-pub fn teacher_response(dialog: &Data, bot_memory: &Vec<String>, user_input: &str) -> String {
-    let index = index_of_most_similar_section(&dialog.Sections, bot_memory);
-    let section: Vec<Text> = dialog.Sections[index].clone();
+pub fn teacher_response(dialog: &Data, bot_memory: &[String], user_input: &str) -> String {
+    // Skip empty sections so we never land on dialogs::load's leading empty section.
+    let candidates: Vec<&Vec<Text>> = dialog.Sections.iter().filter(|s| !s.is_empty()).collect();
+    if candidates.is_empty() {
+        return String::new();
+    }
+    let sections_owned: Vec<Vec<Text>> = candidates.iter().map(|s| (*s).clone()).collect();
+    let index = index_of_most_similar_section(&sections_owned, bot_memory);
+    let section: &Vec<Text> = &sections_owned[index];
 
-    // I want to check what question by the user inside of the chosen section best matches the
-    // current user input and then I want to return the next bot response from the function
-    
+    let mut found = false;
     let mut highscore: u8 = 0;
     let mut idx_of_highest: usize = 0;
     for (index, text) in section.iter().enumerate() {
-        match text {
-            Text::User(s) => {
-                let score = string_similarity(&s.as_str(), &user_input);
-                if score > highscore { highscore = score; idx_of_highest = index; }
+        if let Text::User(s) = text {
+            let score = string_similarity(s.as_str(), user_input);
+            if !found || score > highscore {
+                highscore = score;
+                idx_of_highest = index;
+                found = true;
             }
-            Text::Bot(_) => { continue; }
         }
     }
-    
-    // +1 Because I want to get the Bot response to the user question that is at idx_of_highest
-    let teacher: Text = section[idx_of_highest + 1].clone();
-    if let Text::Bot(s) = teacher {
-        return s;
+
+    if !found || idx_of_highest + 1 >= section.len() {
+        return String::new();
     }
-    else { return String::new(); }
+    if let Text::Bot(s) = &section[idx_of_highest + 1] {
+        s.clone()
+    } else {
+        String::new()
+    }
 }
