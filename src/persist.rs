@@ -1,12 +1,13 @@
+use crate::embeddings::Embedding;
 use crate::gpu::Gpu;
-use crate::neural_network::{Activation, Layer, Network};
+use crate::neural_network::{Activation, Layer, Network, input_size_for};
 use anyhow::{Result, anyhow, bail};
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::Path;
 
 const MAGIC: u32 = 0x4D4F_444C; // "MODL"
-const VERSION: u32 = 1;
+const VERSION: u32 = 2;
 
 fn write_u32<W: Write>(w: &mut W, v: u32) -> Result<()> {
     w.write_all(&v.to_le_bytes())?;
@@ -27,7 +28,6 @@ fn read_u8<R: Read>(r: &mut R) -> Result<u8> {
     Ok(b[0])
 }
 fn write_f32_slice<W: Write>(w: &mut W, data: &[f32]) -> Result<()> {
-    // Reinterpret as bytes — host is little-endian on every platform we run on.
     let bytes: &[u8] =
         unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4) };
     w.write_all(bytes)?;
@@ -62,10 +62,16 @@ pub fn save<P: AsRef<Path>>(net: &Network, path: P) -> Result<()> {
     let mut w = BufWriter::new(f);
     write_u32(&mut w, MAGIC)?;
     write_u32(&mut w, VERSION)?;
-    write_u32(&mut w, net.input_size as u32)?;
+    write_u32(&mut w, net.embed_dim as u32)?;
+    write_u32(&mut w, net.context_window as u32)?;
     write_u32(&mut w, net.vocab_size as u32)?;
     write_u32(&mut w, net.hidden_size as u32)?;
     write_u32(&mut w, net.hidden_layers as u32)?;
+
+    // Embedding
+    write_f32_slice(&mut w, &net.embedding.weights)?;
+
+    // Dense layers
     write_u32(&mut w, net.layers.len() as u32)?;
     for layer in &net.layers {
         write_u32(&mut w, layer.rows as u32)?;
@@ -79,15 +85,16 @@ pub fn save<P: AsRef<Path>>(net: &Network, path: P) -> Result<()> {
 }
 
 pub struct LoadedShape {
-    pub input_size: usize,
+    pub embed_dim: usize,
+    pub context_window: usize,
     pub vocab_size: usize,
     pub hidden_size: usize,
     pub hidden_layers: usize,
 }
 
-/// Attempt to load a model. Returns Ok(Some(net)) on success, Ok(None) if the
-/// file is absent. Returns the shape mismatch info as an error so the caller
-/// can decide to retrain from scratch.
+/// Load a v2 model. Vocab growth (saved vocab < expected vocab) is handled by
+/// extending the embedding table and the output layer with fresh random rows;
+/// the rest of the structure must match exactly.
 pub fn load<P: AsRef<Path>>(
     path: P,
     gpu: &Gpu,
@@ -106,47 +113,93 @@ pub fn load<P: AsRef<Path>>(
     }
     let version = read_u32(&mut r)?;
     if version != VERSION {
-        bail!("model file version {} not supported", version);
+        bail!(
+            "model file version {} not supported (expected {})",
+            version,
+            VERSION
+        );
     }
-    let input_size = read_u32(&mut r)? as usize;
-    let vocab_size = read_u32(&mut r)? as usize;
+
+    let embed_dim = read_u32(&mut r)? as usize;
+    let context_window = read_u32(&mut r)? as usize;
+    let saved_vocab_size = read_u32(&mut r)? as usize;
     let hidden_size = read_u32(&mut r)? as usize;
     let hidden_layers = read_u32(&mut r)? as usize;
-    let layer_count = read_u32(&mut r)? as usize;
 
-    if input_size != expected.input_size
-        || vocab_size != expected.vocab_size
+    if embed_dim != expected.embed_dim
+        || context_window != expected.context_window
         || hidden_size != expected.hidden_size
         || hidden_layers != expected.hidden_layers
     {
         bail!(
-            "model shape mismatch: saved (in={}, vocab={}, hidden={}x{}) vs expected (in={}, vocab={}, hidden={}x{})",
-            input_size,
-            vocab_size,
+            "model shape mismatch: saved (embed={}, ctx={}, hidden={}x{}) vs expected (embed={}, ctx={}, hidden={}x{})",
+            embed_dim,
+            context_window,
             hidden_size,
             hidden_layers,
-            expected.input_size,
-            expected.vocab_size,
+            expected.embed_dim,
+            expected.context_window,
             expected.hidden_size,
             expected.hidden_layers,
         );
     }
+    if saved_vocab_size > expected.vocab_size {
+        bail!(
+            "saved vocab ({}) is larger than current vocab ({}); refusing to truncate",
+            saved_vocab_size,
+            expected.vocab_size
+        );
+    }
 
+    let embed_weights = read_f32_vec(&mut r, saved_vocab_size * embed_dim)?;
+    let mut embedding = Embedding::from_parts(saved_vocab_size, embed_dim, embed_weights);
+
+    let layer_count = read_u32(&mut r)? as usize;
     let mut layers = Vec::with_capacity(layer_count);
-    for _ in 0..layer_count {
+    for i in 0..layer_count {
         let rows = read_u32(&mut r)? as usize;
         let cols = read_u32(&mut r)? as usize;
         let act = activation_from_code(read_u8(&mut r)?)?;
         let weights = read_f32_vec(&mut r, rows * cols)?;
         let biases = read_f32_vec(&mut r, rows)?;
+        // Sanity: the output (last) layer's rows should equal saved_vocab_size;
+        // input (first) layer's cols should equal input_size_for(embed_dim, ctx).
+        if i == 0 && cols != input_size_for(embed_dim, context_window) {
+            bail!(
+                "first layer cols ({}) does not match expected input size ({})",
+                cols,
+                input_size_for(embed_dim, context_window)
+            );
+        }
+        if i == layer_count - 1 && rows != saved_vocab_size {
+            bail!(
+                "output layer rows ({}) does not match saved vocab ({})",
+                rows,
+                saved_vocab_size
+            );
+        }
         layers.push(Layer::from_parts(rows, cols, act, weights, biases, gpu)?);
     }
 
+    // Grow embedding + output layer if the corpus has added new vocab entries.
+    let mut rng = rand::thread_rng();
+    if expected.vocab_size > saved_vocab_size {
+        embedding.extend_to(expected.vocab_size, &mut rng);
+        let last = layers.len() - 1;
+        layers[last].extend_rows(expected.vocab_size, gpu, &mut rng)?;
+        eprintln!(
+            "Extended saved model from vocab {} to {} (new rows initialized randomly).",
+            saved_vocab_size, expected.vocab_size
+        );
+    }
+
     Ok(Some(Network {
+        embedding,
         layers,
-        input_size,
-        vocab_size,
+        vocab_size: expected.vocab_size,
         hidden_size,
         hidden_layers,
+        embed_dim,
+        context_window,
     }))
 }

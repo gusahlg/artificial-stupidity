@@ -2,7 +2,7 @@ use rust_fun::dialogs::Data;
 use rust_fun::gpu::Gpu;
 use rust_fun::memory;
 use rust_fun::neural_network::{
-    HIDDEN_SIZE, NUMBER_OF_HIDDEN_LAYERS, generate, generate_and_train, input_size_for,
+    CONTEXT_WINDOW, EMBED_DIM, HIDDEN_SIZE, NUMBER_OF_HIDDEN_LAYERS, generate, generate_and_train,
     network_init, pretrain,
 };
 use rust_fun::persist::{self, LoadedShape};
@@ -26,19 +26,16 @@ fn main() -> anyhow::Result<()> {
 
     let mut dialog: Data = Data::new();
     dialog.load();
-    let words_in_vocab = memory::load();
-    println!("Vocab size: {}", words_in_vocab.len());
-
-    let hidden_size: usize = HIDDEN_SIZE;
-    let hidden_layers: usize = NUMBER_OF_HIDDEN_LAYERS;
-    let output_size: usize = words_in_vocab.len();
-    let input_size: usize = input_size_for(words_in_vocab.len());
+    let vocab = dialog.build_vocab();
+    memory::save_vocab(&vocab);
+    println!("Vocab size: {}", vocab.len());
 
     let shape = LoadedShape {
-        input_size,
-        vocab_size: output_size,
-        hidden_size,
-        hidden_layers,
+        embed_dim: EMBED_DIM,
+        context_window: CONTEXT_WINDOW,
+        vocab_size: vocab.len(),
+        hidden_size: HIDDEN_SIZE,
+        hidden_layers: NUMBER_OF_HIDDEN_LAYERS,
     };
 
     let mut net = match persist::load(MODEL_PATH, &gpu, shape) {
@@ -48,13 +45,20 @@ fn main() -> anyhow::Result<()> {
         }
         Ok(None) => {
             println!(
-                "No saved model at {}. Initializing fresh network ({} hidden layers x {} units).",
-                MODEL_PATH, hidden_layers, hidden_size
+                "No saved model at {}. Fresh init (embed={}, ctx={}, hidden={}x{}).",
+                MODEL_PATH, EMBED_DIM, CONTEXT_WINDOW, NUMBER_OF_HIDDEN_LAYERS, HIDDEN_SIZE
             );
-            let mut net = network_init(&gpu, input_size, hidden_size, hidden_layers, output_size)?;
+            let mut net = network_init(
+                &gpu,
+                EMBED_DIM,
+                CONTEXT_WINDOW,
+                HIDDEN_SIZE,
+                NUMBER_OF_HIDDEN_LAYERS,
+                vocab.len(),
+            )?;
             println!("Pretraining on dialog corpus ({} epochs)...", PRETRAIN_EPOCHS);
             let t0 = Instant::now();
-            pretrain(&gpu, &mut net, &dialog, &words_in_vocab, PRETRAIN_LR, PRETRAIN_EPOCHS)?;
+            pretrain(&gpu, &mut net, &dialog, &vocab, PRETRAIN_LR, PRETRAIN_EPOCHS)?;
             println!(
                 "Pretraining done in {:.2}s. Saving initial weights.",
                 t0.elapsed().as_secs_f64()
@@ -67,9 +71,16 @@ fn main() -> anyhow::Result<()> {
                 "Could not load saved model ({}). Initializing fresh and pretraining.",
                 e
             );
-            let mut net = network_init(&gpu, input_size, hidden_size, hidden_layers, output_size)?;
+            let mut net = network_init(
+                &gpu,
+                EMBED_DIM,
+                CONTEXT_WINDOW,
+                HIDDEN_SIZE,
+                NUMBER_OF_HIDDEN_LAYERS,
+                vocab.len(),
+            )?;
             let t0 = Instant::now();
-            pretrain(&gpu, &mut net, &dialog, &words_in_vocab, PRETRAIN_LR, PRETRAIN_EPOCHS)?;
+            pretrain(&gpu, &mut net, &dialog, &vocab, PRETRAIN_LR, PRETRAIN_EPOCHS)?;
             println!(
                 "Pretraining done in {:.2}s. Saving initial weights.",
                 t0.elapsed().as_secs_f64()
@@ -128,12 +139,12 @@ fn main() -> anyhow::Result<()> {
                     &mut net,
                     &input,
                     &bot_memory,
-                    &words_in_vocab,
+                    &vocab,
                     &dialog,
                     ONLINE_LR,
                 )?
             } else {
-                generate(&gpu, &mut net, &input, &bot_memory, &words_in_vocab)?
+                generate(&gpu, &mut net, &input, &bot_memory, &vocab)?
             };
             println!(
                 "Time to get answer in seconds: {:.3}",

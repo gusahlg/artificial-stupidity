@@ -9,15 +9,17 @@ with an auto-trainer binary.
 
 - `src/main.rs` — interactive chat (`rust_fun` binary)
 - `src/bin/train.rs` — standalone auto-trainer (`train` binary)
+- `src/tokenizer.rs` — lowercase + punctuation-splitting tokenizer
+- `src/embeddings/mod.rs` — trainable word embedding table
 - `src/neural_network.rs` — model, training loop, generation
-- `src/teacher.rs` — softmax + cross-entropy backprop
-- `src/persist.rs` — save/load `model.bin`
+- `src/teacher.rs` — softmax + cross-entropy backprop (incl. input gradient for embeddings)
+- `src/persist.rs` — save/load `model.bin` (v2: includes embeddings)
 - `src/gpu.rs` — Vulkan/CPU backend dispatch
-- `src/machine_learning.rs` — section-similarity teacher lookup
+- `src/machine_learning.rs` — section-similarity + embedding-cosine teacher lookup
 - `src/dialogs.rs`, `src/memory.rs` — corpus + vocab loaders
 - `data/dialogs.txt` — training corpus
-- `vocab.txt` — word vocabulary (grown automatically from the corpus)
-- `model.bin` — saved weights and biases (created on first run)
+- `vocab.txt` — derived vocabulary (regenerated from corpus on every run)
+- `model.bin` — saved embeddings + weights + biases (created on first run)
 
 ## Build
 
@@ -90,17 +92,22 @@ Most knobs live as `pub const` at the top of `src/neural_network.rs`:
 
 | Constant | Meaning | Notes |
 |---|---|---|
+| `EMBED_DIM` | width of each word embedding | bigger = more semantic capacity per word |
+| `CONTEXT_WINDOW` | how many recent tokens feed the network | embeddings are concatenated, so input grows linearly |
 | `HIDDEN_SIZE` | width of each hidden layer | bigger = more capacity, slower |
 | `NUMBER_OF_HIDDEN_LAYERS` | depth (output layer added on top) | 2 works well; deeper needs more data |
-| `CONTEXT_WINDOW` | how many recent words feed the BoW input | larger = more context, slower input encoding |
-| `EXTRA_FEATURES` | hand-crafted scalar features | don't change unless you also change `handcrafted_features` |
 | `GRAD_CLIP` | symmetric per-element gradient clip | raise to allow bigger updates |
+| `MOMENTUM` | SGD momentum (0 = pure SGD) | 0.0 is the default; >0 needs careful tuning here |
+| `WEIGHT_DECAY` | L2 weight decay coefficient | 1e-4 is a sensible starting point |
 | `MAX_GENERATION_LEN` | hard cap on tokens per reply | model also learns to emit `</BOT>` to stop earlier |
 | `TOP_K_SAMPLE` | sample from the top-k softmax outputs | 1 = greedy/deterministic, larger = more random |
 
-> Changing `HIDDEN_SIZE` or `NUMBER_OF_HIDDEN_LAYERS` invalidates an
-> existing `model.bin`. The loader detects the shape mismatch, throws
-> away the stale weights, and the next run pretrains a fresh network.
+> Changing `EMBED_DIM`, `CONTEXT_WINDOW`, `HIDDEN_SIZE`, or
+> `NUMBER_OF_HIDDEN_LAYERS` invalidates an existing `model.bin`. The
+> loader detects the shape mismatch, throws away the stale weights, and
+> the next run pretrains a fresh network. A larger vocab (new words in
+> the corpus) is handled automatically — the loader extends the
+> embedding/output layers with new random rows.
 
 Online-chat hyperparameters live in `src/main.rs`:
 

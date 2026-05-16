@@ -6,3 +6,4 @@ pub mod memory;
 pub mod neural_network;
 pub mod persist;
 pub mod teacher;
+pub mod tokenizer;

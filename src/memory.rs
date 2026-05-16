@@ -1,34 +1,12 @@
+//! Vocab persistence. The canonical vocab is rebuilt from the corpus on each
+//! startup; this module just writes it to `vocab.txt` so a human can inspect
+//! what the network sees.
+
 use std::io::Write;
 
-pub fn load() -> Vec<String> {
-    std::fs::read_to_string("vocab.txt")
-        .unwrap()
-        .lines()
-        .map(|s| s.to_string())
-        .collect()
-}
-
-pub fn append(text: &str) {
-    let lines = load();
-    let mut words: Vec<&str> = text.split_whitespace().collect();
-    let mut i = 0;
-    while i < words.len() {
-        if lines.iter().any(|line| line == words[i]) {
-            words.remove(i);
-        } else {
-            i += 1;
-        }
-    }
-
-
-    let mut f = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open("vocab.txt")
-        .unwrap();
-
-    for w in words{
-        writeln!(f, "{}", w).unwrap();
+pub fn save_vocab(vocab: &[String]) {
+    let mut f = std::fs::File::create("vocab.txt").expect("failed to open vocab.txt");
+    for w in vocab {
+        writeln!(f, "{w}").expect("failed to write vocab.txt");
     }
 }
-

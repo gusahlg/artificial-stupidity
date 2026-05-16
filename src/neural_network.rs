@@ -1,20 +1,32 @@
 use crate::dialogs::{Data, Text};
+use crate::embeddings::Embedding;
 use crate::gpu::{Backend, Gpu, LayerGpu};
 use crate::machine_learning::teacher_response;
 use crate::teacher::compute_deltas;
+use crate::tokenizer::{END_OF_BOT, PAD, UNK, tokenize};
 use anyhow::Result;
-use rand::seq::SliceRandom;
 use rand::Rng;
+use rand::seq::SliceRandom;
 use std::collections::HashMap;
 
+pub const EMBED_DIM: usize = 64;
 pub const HIDDEN_SIZE: usize = 256;
 pub const NUMBER_OF_HIDDEN_LAYERS: usize = 2;
 pub const CONTEXT_WINDOW: usize = 8;
-pub const EXTRA_FEATURES: usize = 7;
+pub const POSITION_FEATURES: usize = 1;
 pub const GRAD_CLIP: f32 = 5.0;
 pub const MAX_GENERATION_LEN: usize = 40;
 pub const TOP_K_SAMPLE: usize = 5;
-pub const END_OF_BOT: &str = "</BOT>";
+// SGD without momentum: cross-entropy + softmax + dense output is very
+// sensitive to compounding velocity on the output biases. Pure SGD with
+// a small lr-decay converges steadily; momentum can be re-added if/when
+// we move to a per-parameter normalized optimizer (Adam, RMSProp).
+pub const MOMENTUM: f32 = 0.0;
+pub const WEIGHT_DECAY: f32 = 1e-4;
+
+pub fn input_size_for(embed_dim: usize, context: usize) -> usize {
+    embed_dim * context + POSITION_FEATURES
+}
 
 #[derive(Copy, Clone, PartialEq, Debug)]
 pub enum Activation {
@@ -23,8 +35,10 @@ pub enum Activation {
 }
 
 pub struct Layer {
-    pub weights: Vec<f32>, // row-major [rows * cols]
+    pub weights: Vec<f32>,
     pub biases: Vec<f32>,
+    pub w_velocity: Vec<f32>,
+    pub b_velocity: Vec<f32>,
     pub rows: usize,
     pub cols: usize,
     pub activation: Activation,
@@ -52,6 +66,8 @@ impl Layer {
         let biases = vec![0.0f32; rows];
         let layer_gpu = Self::alloc_gpu(rows, cols, &weights, gpu)?;
         Ok(Self {
+            w_velocity: vec![0.0; rows * cols],
+            b_velocity: vec![0.0; rows],
             weights,
             biases,
             rows,
@@ -75,6 +91,8 @@ impl Layer {
     ) -> Result<Self> {
         let layer_gpu = Self::alloc_gpu(rows, cols, &weights, gpu)?;
         Ok(Self {
+            w_velocity: vec![0.0; rows * cols],
+            b_velocity: vec![0.0; rows],
             weights,
             biases,
             rows,
@@ -126,7 +144,6 @@ impl Layer {
             };
             out.push(a);
         }
-
         if cache {
             self.last_input.clear();
             self.last_input.extend_from_slice(input);
@@ -134,14 +151,41 @@ impl Layer {
         }
         Ok(out)
     }
+
+    /// Grow the output dimension (rows) by re-randomizing new rows. Used when
+    /// the vocab has expanded between runs. Re-allocates GPU buffers.
+    pub fn extend_rows(
+        &mut self,
+        new_rows: usize,
+        gpu: &Gpu,
+        rng: &mut rand::rngs::ThreadRng,
+    ) -> Result<()> {
+        if new_rows <= self.rows {
+            return Ok(());
+        }
+        let extra = new_rows - self.rows;
+        let bound = (6.0f32 / (new_rows + self.cols) as f32).sqrt();
+        for _ in 0..(extra * self.cols) {
+            self.weights.push(rng.gen_range(-bound..bound));
+        }
+        self.biases.resize(new_rows, 0.0);
+        self.w_velocity.resize(self.weights.len(), 0.0);
+        self.b_velocity.resize(new_rows, 0.0);
+        self.matmul_out = vec![0.0; new_rows];
+        self.rows = new_rows;
+        self.layer_gpu = Self::alloc_gpu(self.rows, self.cols, &self.weights, gpu)?;
+        Ok(())
+    }
 }
 
 pub struct Network {
+    pub embedding: Embedding,
     pub layers: Vec<Layer>,
-    pub input_size: usize,
     pub vocab_size: usize,
     pub hidden_size: usize,
     pub hidden_layers: usize,
+    pub embed_dim: usize,
+    pub context_window: usize,
 }
 
 fn softmax_inplace(x: &mut [f32]) {
@@ -171,8 +215,21 @@ fn softmax_inplace(x: &mut [f32]) {
     }
 }
 
+fn make_input(embed: Vec<f32>, position: usize) -> Vec<f32> {
+    let mut v = embed;
+    v.push((position as f32 / 100.0).min(1.0));
+    v
+}
+
 impl Network {
-    pub fn forward(&mut self, gpu: &Gpu, mut input: Vec<f32>) -> Result<Vec<f32>> {
+    pub fn forward(
+        &mut self,
+        gpu: &Gpu,
+        token_ids: &[usize],
+        position: usize,
+    ) -> Result<Vec<f32>> {
+        let embed = self.embedding.forward(token_ids, false);
+        let mut input = make_input(embed, position);
         for layer in &mut self.layers {
             input = layer.forward(gpu, &input, false)?;
         }
@@ -180,156 +237,138 @@ impl Network {
         Ok(input)
     }
 
-    pub fn forward_and_cache(&mut self, gpu: &Gpu, mut input: Vec<f32>) -> Result<Vec<f32>> {
+    pub fn forward_and_cache(
+        &mut self,
+        gpu: &Gpu,
+        token_ids: &[usize],
+        position: usize,
+    ) -> Result<Vec<f32>> {
+        let embed = self.embedding.forward(token_ids, true);
+        let mut input = make_input(embed, position);
         let n = self.layers.len();
         for (i, layer) in self.layers.iter_mut().enumerate() {
             input = layer.forward(gpu, &input, true)?;
             if i == n - 1 {
                 softmax_inplace(&mut input);
-                // Replace cached pre-softmax logits with softmax probs so the
-                // cross-entropy gradient collapses to (p - one_hot).
                 layer.last_activations.clone_from(&input);
             }
         }
         Ok(input)
     }
 
-    /// Single SGD update from one cached forward pass. Sparse-aware: skips
-    /// weight updates for input entries that are exactly zero, which makes the
-    /// input-layer update ~400x cheaper for our BoW input.
     pub fn train_step(&mut self, lr: f32, target_idx: usize) {
-        let deltas = compute_deltas(self, target_idx);
+        let bp = compute_deltas(self, target_idx);
         for (idx, layer) in self.layers.iter_mut().enumerate() {
-            let d = &deltas[idx];
+            let d = &bp.layer_deltas[idx];
             let cols = layer.cols;
-            // Pre-collect non-zero input columns so we don't probe `x == 0` in
-            // the inner loop for every row.
-            let nz_inputs: Vec<(usize, f32)> = layer
-                .last_input
-                .iter()
-                .enumerate()
-                .filter_map(|(k, &v)| if v != 0.0 { Some((k, v)) } else { None })
-                .collect();
             for j in 0..layer.rows {
                 let g = d[j].clamp(-GRAD_CLIP, GRAD_CLIP);
                 if g == 0.0 {
                     continue;
                 }
-                layer.biases[j] -= lr * g;
-                let lr_g = lr * g;
+                // Clip the velocity itself so momentum can't accumulate into
+                // huge effective per-step updates over the course of an epoch.
+                let bv = (MOMENTUM * layer.b_velocity[j] + g).clamp(-GRAD_CLIP, GRAD_CLIP);
+                layer.b_velocity[j] = bv;
+                let mut b = layer.biases[j];
+                b -= lr * bv;
+                b -= lr * WEIGHT_DECAY * b;
+                layer.biases[j] = b;
+
                 let row_base = j * cols;
-                for &(k, v) in &nz_inputs {
-                    layer.weights[row_base + k] -= lr_g * v;
+                for k in 0..cols {
+                    let x = layer.last_input[k];
+                    if x == 0.0 {
+                        continue;
+                    }
+                    let wg = g * x;
+                    let vidx = row_base + k;
+                    let v =
+                        (MOMENTUM * layer.w_velocity[vidx] + wg).clamp(-GRAD_CLIP, GRAD_CLIP);
+                    layer.w_velocity[vidx] = v;
+                    let mut w = layer.weights[vidx];
+                    w -= lr * v;
+                    w -= lr * WEIGHT_DECAY * w;
+                    layer.weights[vidx] = w;
                 }
             }
             layer.gpu_dirty = true;
         }
+        // Apply the input-gradient slice that corresponds to the embedding
+        // section of the input vector (everything before the trailing position
+        // scalar). Same lr/momentum/wd.
+        let embed_grad_len = self.context_window * self.embed_dim;
+        self.embedding
+            .apply_grad(&bp.input_grad[..embed_grad_len], lr, MOMENTUM, WEIGHT_DECAY);
     }
 }
 
 pub struct VocabIndex<'a> {
     pub words: &'a [String],
     pub idx: HashMap<&'a str, usize>,
+    pub pad_id: usize,
+    pub unk_id: usize,
+    pub eob_id: Option<usize>,
 }
 
 impl<'a> VocabIndex<'a> {
     pub fn new(words: &'a [String]) -> Self {
-        let idx = words
+        let idx: HashMap<&str, usize> = words
             .iter()
             .enumerate()
             .map(|(i, w)| (w.as_str(), i))
             .collect();
-        Self { words, idx }
+        let pad_id = idx.get(PAD).copied().unwrap_or(0);
+        let unk_id = idx.get(UNK).copied().unwrap_or(1);
+        let eob_id = idx.get(END_OF_BOT).copied();
+        Self {
+            words,
+            idx,
+            pad_id,
+            unk_id,
+            eob_id,
+        }
     }
     pub fn lookup(&self, w: &str) -> Option<usize> {
         self.idx.get(w).copied()
     }
+    pub fn id_or_unk(&self, w: &str) -> usize {
+        self.lookup(w).unwrap_or(self.unk_id)
+    }
+    pub fn ids_or_unk(&self, tokens: &[String]) -> Vec<usize> {
+        tokens.iter().map(|t| self.id_or_unk(t)).collect()
+    }
 }
 
-fn handcrafted_features(text: &str, position: usize, out: &mut [f32]) {
-    debug_assert_eq!(out.len(), EXTRA_FEATURES);
-    let chars_total = text.chars().count().max(1) as f32;
-    let words: Vec<&str> = text.split_whitespace().collect();
-    let word_count = words.len().max(1);
-
-    let avg = words.iter().map(|w| w.len()).sum::<usize>() as f32 / word_count as f32;
-    out[0] = (avg / 10.0).min(1.0);
-    out[1] = (word_count as f32 / 50.0).min(1.0);
-    let qm = text.chars().filter(|&c| c == '?').count();
-    out[2] = (qm as f32 / 5.0).min(1.0);
-
-    let vowels = "aeiou";
-    let (mut v, mut c) = (0u32, 0u32);
-    for ch in text.to_lowercase().chars() {
-        if vowels.contains(ch) {
-            v += 1;
-        } else if ch.is_alphabetic() {
-            c += 1;
-        }
+/// Build the fixed-width token-id window for the network input. Older tokens
+/// are dropped, newest token sits at the rightmost slot, missing prefix slots
+/// are filled with PAD so position 0 still has a valid input.
+pub fn build_token_window(context: &[String], vocab: &VocabIndex<'_>, window: usize) -> Vec<usize> {
+    let mut ids = vec![vocab.pad_id; window];
+    if context.is_empty() {
+        return ids;
     }
-    let ratio = if c > 0 { v as f32 / c as f32 } else { 0.0 };
-    out[3] = (ratio / 2.0).min(1.0);
-
-    let mut score = 0u32;
-    for ch in text.to_lowercase().chars() {
-        match ch {
-            'e' => score += 10,
-            'a' => score += 9,
-            'r' => score += 8,
-            'i' => score += 7,
-            'o' => score += 6,
-            't' => score += 5,
-            'n' => score += 4,
-            's' => score += 3,
-            _ => {}
-        }
+    let start = context.len().saturating_sub(window);
+    let slice = &context[start..];
+    let dst_start = window - slice.len();
+    for (i, tok) in slice.iter().enumerate() {
+        ids[dst_start + i] = vocab.id_or_unk(tok);
     }
-    out[4] = (score as f32 / (chars_total * 10.0)).min(1.0);
-    let uniq = text
-        .chars()
-        .collect::<std::collections::HashSet<char>>()
-        .len() as f32;
-    out[5] = (uniq / chars_total).min(1.0);
-    out[6] = (position as f32 / 100.0).min(1.0);
-}
-
-/// Build the network input as: [bag-of-words over the last CONTEXT_WINDOW tokens
-/// || EXTRA_FEATURES hand-crafted scalars]. The BoW part is what actually carries
-/// word-level context; the scalars add a bit of structural prior.
-pub fn build_input(text: &str, position: usize, vocab: &VocabIndex<'_>) -> Vec<f32> {
-    let v = vocab.words.len();
-    let mut features = vec![0.0f32; v + EXTRA_FEATURES];
-    let words: Vec<&str> = text.split_whitespace().collect();
-    let start = words.len().saturating_sub(CONTEXT_WINDOW);
-    let mut counted = 0u32;
-    for w in &words[start..] {
-        if let Some(idx) = vocab.lookup(w) {
-            features[idx] += 1.0;
-            counted += 1;
-        }
-    }
-    if counted > 0 {
-        let inv = 1.0 / counted as f32;
-        for x in features[..v].iter_mut() {
-            *x *= inv;
-        }
-    }
-    handcrafted_features(text, position, &mut features[v..]);
-    features
-}
-
-pub fn input_size_for(vocab_len: usize) -> usize {
-    vocab_len + EXTRA_FEATURES
+    ids
 }
 
 pub fn network_init(
     gpu: &Gpu,
-    input_size: usize,
+    embed_dim: usize,
+    context_window: usize,
     hidden_size: usize,
     hidden_layers: usize,
-    output_size: usize,
+    vocab_size: usize,
 ) -> Result<Network> {
     let mut rng = rand::thread_rng();
+    let embedding = Embedding::new(vocab_size, embed_dim, &mut rng);
+    let input_size = input_size_for(embed_dim, context_window);
+
     let mut layers = Vec::with_capacity(hidden_layers + 1);
     layers.push(Layer::new(hidden_size, input_size, Activation::Tanh, gpu, &mut rng)?);
     for _ in 1..hidden_layers {
@@ -342,18 +381,21 @@ pub fn network_init(
         )?);
     }
     layers.push(Layer::new(
-        output_size,
+        vocab_size,
         hidden_size,
         Activation::Linear,
         gpu,
         &mut rng,
     )?);
+
     Ok(Network {
+        embedding,
         layers,
-        input_size,
-        vocab_size: output_size,
+        vocab_size,
         hidden_size,
         hidden_layers,
+        embed_dim,
+        context_window,
     })
 }
 
@@ -384,6 +426,22 @@ fn sample_top_k(probs: &[f32], k: usize) -> usize {
     top.last().unwrap().1
 }
 
+fn detokenize(tokens: &[String]) -> String {
+    let mut out = String::new();
+    for tok in tokens {
+        let is_punct = tok.chars().all(|c| !c.is_alphanumeric() && c != '\'');
+        if out.is_empty() {
+            out.push_str(tok);
+        } else if is_punct {
+            out.push_str(tok);
+        } else {
+            out.push(' ');
+            out.push_str(tok);
+        }
+    }
+    out
+}
+
 pub fn generate(
     gpu: &Gpu,
     net: &mut Network,
@@ -392,26 +450,25 @@ pub fn generate(
     words: &[String],
 ) -> Result<String> {
     let vocab = VocabIndex::new(words);
-    let prelude = memory.join(" ");
-    let mut text = if prelude.is_empty() {
-        start.to_string()
-    } else {
-        format!("{} {}", prelude, start)
-    };
-    let prefix_len = text.len();
+    let mut context: Vec<String> = Vec::new();
+    for m in memory {
+        context.extend(tokenize(m));
+    }
+    context.extend(tokenize(start));
 
+    let mut produced: Vec<String> = Vec::new();
     for i in 0..MAX_GENERATION_LEN {
-        let features = build_input(&text, i, &vocab);
-        let probs = net.forward(gpu, features)?;
+        let window = build_token_window(&context, &vocab, CONTEXT_WINDOW);
+        let probs = net.forward(gpu, &window, i)?;
         let idx = sample_top_k(&probs, TOP_K_SAMPLE);
-        let next_word = &words[idx];
-        if next_word == END_OF_BOT || next_word == "<USER>" || next_word == "<SEC>" {
+        let next = &words[idx];
+        if next == END_OF_BOT {
             break;
         }
-        text.push(' ');
-        text.push_str(next_word);
+        context.push(next.clone());
+        produced.push(next.clone());
     }
-    Ok(text[prefix_len..].trim().to_string())
+    Ok(detokenize(&produced))
 }
 
 pub fn generate_and_train(
@@ -423,102 +480,103 @@ pub fn generate_and_train(
     data: &Data,
     lr: f32,
 ) -> Result<String> {
+    // Tokenize once.
+    let user_tokens = tokenize(start);
+    let mut memory_tokens: Vec<String> = Vec::new();
+    for m in memory {
+        memory_tokens.extend(tokenize(m));
+    }
+    let mut scoring_memory = memory_tokens.clone();
+    scoring_memory.extend(user_tokens.iter().cloned());
+
+    // Pull teacher response with embedding-based similarity. The closure
+    // borrows the embedding immutably; that borrow ends before we mutate the
+    // network below.
+    let teacher: Vec<String> = {
+        let vocab = VocabIndex::new(words);
+        teacher_response(data, &scoring_memory, &user_tokens, |toks| {
+            let ids = vocab.ids_or_unk(toks);
+            net.embedding.centroid(&ids)
+        })
+    };
+
     let vocab = VocabIndex::new(words);
-    let mut scoring_memory: Vec<String> = memory.to_vec();
-    scoring_memory.push(start.to_string());
-    let teacher_sentence = teacher_response(data, &scoring_memory, start);
-    let mut teacher: Vec<String> = teacher_sentence
-        .split_whitespace()
-        .map(|w| w.to_string())
-        .collect();
-    if !teacher.is_empty() {
-        teacher.push(END_OF_BOT.to_string());
+
+    let mut context: Vec<String> = memory_tokens;
+    context.extend(user_tokens.iter().cloned());
+    let mut produced: Vec<String> = Vec::new();
+
+    // Teacher list + sentinel </BOT> so the model also learns to stop.
+    let mut targets: Vec<&str> = teacher.iter().map(|s| s.as_str()).collect();
+    if !targets.is_empty() {
+        targets.push(END_OF_BOT);
     }
 
-    let prelude = memory.join(" ");
-    let mut text = if prelude.is_empty() {
-        start.to_string()
-    } else {
-        format!("{} {}", prelude, start)
-    };
-    let prefix_len = text.len();
-    let mut produced = String::new();
-
     for i in 0..MAX_GENERATION_LEN {
-        match teacher.get(i) {
+        let window = build_token_window(&context, &vocab, CONTEXT_WINDOW);
+
+        match targets.get(i).copied() {
             Some(t) => {
-                let features = build_input(&text, i, &vocab);
-                let _probs = net.forward_and_cache(gpu, features)?;
-                if let Some(target) = vocab.lookup(t) {
-                    net.train_step(lr, target);
+                let _probs = net.forward_and_cache(gpu, &window, i)?;
+                if let Some(target_id) = vocab.lookup(t) {
+                    net.train_step(lr, target_id);
                 }
                 if t == END_OF_BOT {
                     break;
                 }
-                text.push(' ');
-                text.push_str(t);
-                produced.push(' ');
-                produced.push_str(t);
+                context.push(t.to_string());
+                produced.push(t.to_string());
             }
             None => {
-                // No teacher word for this position — pure inference.
-                let features = build_input(&text, i, &vocab);
-                let probs = net.forward(gpu, features)?;
+                let probs = net.forward(gpu, &window, i)?;
                 let idx = sample_top_k(&probs, TOP_K_SAMPLE);
-                let next_word = &words[idx];
-                if next_word == END_OF_BOT || next_word == "<USER>" || next_word == "<SEC>" {
+                let next = &words[idx];
+                if next == END_OF_BOT {
                     break;
                 }
-                text.push(' ');
-                text.push_str(next_word);
-                produced.push(' ');
-                produced.push_str(next_word);
+                context.push(next.clone());
+                produced.push(next.clone());
             }
         }
     }
 
-    if produced.is_empty() {
-        return Ok(text[prefix_len..].trim().to_string());
-    }
-    Ok(produced.trim().to_string())
+    Ok(detokenize(&produced))
 }
 
-/// A single supervised training example: user prompt + (already-built) prelude
-/// context + bot target sequence.
 #[derive(Clone)]
 pub struct TrainPair {
-    pub prelude: String,
-    pub user: String,
-    pub bot: String,
+    pub prelude: Vec<String>,
+    pub user: Vec<String>,
+    pub bot: Vec<String>,
 }
 
 pub fn extract_train_pairs(data: &Data) -> Vec<TrainPair> {
     let mut pairs = Vec::new();
-    for section in &data.Sections {
-        let mut prelude_words: Vec<String> = Vec::new();
+    for section in &data.sections {
+        let mut prelude_tokens: Vec<String> = Vec::new();
         let mut idx = 0;
         while idx + 1 < section.len() {
             let user = match &section[idx] {
-                Text::User(s) => s.clone(),
+                Text::User(t) => t.clone(),
                 _ => {
                     idx += 1;
                     continue;
                 }
             };
             let bot = match &section[idx + 1] {
-                Text::Bot(s) => s.clone(),
+                Text::Bot(t) => t.clone(),
                 _ => {
                     idx += 1;
                     continue;
                 }
             };
             pairs.push(TrainPair {
-                prelude: prelude_words.join(" "),
+                prelude: prelude_tokens.clone(),
                 user: user.clone(),
                 bot: bot.clone(),
             });
-            prelude_words.push(user);
-            prelude_words.push(bot);
+            prelude_tokens.extend(user);
+            prelude_tokens.extend(bot);
             idx += 2;
         }
     }
@@ -526,70 +584,98 @@ pub fn extract_train_pairs(data: &Data) -> Vec<TrainPair> {
 }
 
 pub struct EpochStats {
-    pub avg_loss: f64,
-    pub targets: u64,
+    pub train_loss: f64,
+    pub val_loss: f64,
+    pub train_targets: u64,
+    pub val_targets: u64,
 }
 
-/// Run one supervised epoch over `pairs`. Shuffles every epoch; randomly drops
-/// the in-section prelude with probability `prelude_drop_prob` so the model
-/// also learns to answer cold-start prompts.
+/// One supervised epoch: shuffles `train_pairs`, runs SGD on each bot token
+/// (with </BOT> appended as a stop target), then evaluates val_pairs in
+/// forward-only mode. `prelude_drop_prob` randomly hides the in-section
+/// prelude during training so the model also learns cold-start responses.
 pub fn train_one_epoch(
     gpu: &Gpu,
     net: &mut Network,
-    pairs: &mut [TrainPair],
+    train_pairs: &mut [TrainPair],
+    val_pairs: &[TrainPair],
     words: &[String],
     lr: f32,
     prelude_drop_prob: f32,
 ) -> Result<EpochStats> {
     let vocab = VocabIndex::new(words);
     let mut rng = rand::thread_rng();
-    pairs.shuffle(&mut rng);
+    train_pairs.shuffle(&mut rng);
 
-    let mut total_loss = 0.0f64;
-    let mut count = 0u64;
-
-    for pair in pairs.iter() {
-        let drop_prelude: f32 = rng.gen_range(0.0..1.0);
-        let drop_prelude = drop_prelude < prelude_drop_prob;
-        let prelude = if drop_prelude { "" } else { pair.prelude.as_str() };
-        let mut running = if prelude.is_empty() {
-            pair.user.clone()
+    let mut train_loss = 0.0f64;
+    let mut train_targets = 0u64;
+    for pair in train_pairs.iter() {
+        let drop: f32 = rng.gen_range(0.0..1.0);
+        let prelude: &[String] = if drop < prelude_drop_prob {
+            &[]
         } else {
-            format!("{} {}", prelude, pair.user)
+            &pair.prelude
         };
+        let mut context: Vec<String> = prelude.to_vec();
+        context.extend(pair.user.iter().cloned());
 
-        let bot_tokens: Vec<&str> = pair.bot.split_whitespace().collect();
-        for (i, target_word) in bot_tokens.iter().chain(std::iter::once(&END_OF_BOT)).enumerate() {
-            let features = build_input(&running, i, &vocab);
-            let probs = net.forward_and_cache(gpu, features)?;
-            if let Some(target) = vocab.lookup(target_word) {
-                let p = probs[target].max(1e-9);
-                total_loss += -(p as f64).ln();
-                count += 1;
-                net.train_step(lr, target);
+        let mut targets: Vec<&str> = pair.bot.iter().map(|s| s.as_str()).collect();
+        targets.push(END_OF_BOT);
+
+        for (i, target_word) in targets.iter().enumerate() {
+            let window = build_token_window(&context, &vocab, CONTEXT_WINDOW);
+            let probs = net.forward_and_cache(gpu, &window, i)?;
+            if let Some(target_id) = vocab.lookup(target_word) {
+                let p = probs[target_id].max(1e-9);
+                train_loss += -(p as f64).ln();
+                train_targets += 1;
+                net.train_step(lr, target_id);
             }
             if *target_word == END_OF_BOT {
                 break;
             }
-            running.push(' ');
-            running.push_str(target_word);
+            context.push(target_word.to_string());
         }
     }
 
-    let avg = if count > 0 {
-        total_loss / count as f64
-    } else {
-        0.0
-    };
+    let mut val_loss = 0.0f64;
+    let mut val_targets = 0u64;
+    for pair in val_pairs {
+        let mut context: Vec<String> = pair.prelude.clone();
+        context.extend(pair.user.iter().cloned());
+        let mut targets: Vec<&str> = pair.bot.iter().map(|s| s.as_str()).collect();
+        targets.push(END_OF_BOT);
+        for (i, target_word) in targets.iter().enumerate() {
+            let window = build_token_window(&context, &vocab, CONTEXT_WINDOW);
+            let probs = net.forward(gpu, &window, i)?;
+            if let Some(target_id) = vocab.lookup(target_word) {
+                let p = probs[target_id].max(1e-9);
+                val_loss += -(p as f64).ln();
+                val_targets += 1;
+            }
+            if *target_word == END_OF_BOT {
+                break;
+            }
+            context.push(target_word.to_string());
+        }
+    }
+
     Ok(EpochStats {
-        avg_loss: avg,
-        targets: count,
+        train_loss: if train_targets > 0 {
+            train_loss / train_targets as f64
+        } else {
+            0.0
+        },
+        val_loss: if val_targets > 0 {
+            val_loss / val_targets as f64
+        } else {
+            0.0
+        },
+        train_targets,
+        val_targets,
     })
 }
 
-/// Convenience wrapper used at first-run init: a handful of clean epochs over
-/// the corpus with no data augmentation. The long-running training program is
-/// `train_one_epoch` driven from `src/bin/train.rs`.
 pub fn pretrain(
     gpu: &Gpu,
     net: &mut Network,
@@ -599,15 +685,22 @@ pub fn pretrain(
     epochs: usize,
 ) -> Result<()> {
     let mut pairs = extract_train_pairs(data);
+    let val_n = (pairs.len() / 10).max(1).min(pairs.len().saturating_sub(1));
+    let val_pairs: Vec<TrainPair> = pairs.split_off(pairs.len() - val_n);
     for epoch in 0..epochs {
-        let stats = train_one_epoch(gpu, net, &mut pairs, words, lr, 0.0)?;
+        let stats = train_one_epoch(gpu, net, &mut pairs, &val_pairs, words, lr, 0.0)?;
         println!(
-            "  epoch {}/{}: avg cross-entropy = {:.4} over {} targets",
+            "  epoch {}/{}: train xent={:.4} val xent={:.4} ({} / {} targets)",
             epoch + 1,
             epochs,
-            stats.avg_loss,
-            stats.targets
+            stats.train_loss,
+            stats.val_loss,
+            stats.train_targets,
+            stats.val_targets,
         );
     }
     Ok(())
 }
+
+// re-export cosine for callers that wire teacher_response themselves
+pub use crate::embeddings::cosine as embedding_cosine;
