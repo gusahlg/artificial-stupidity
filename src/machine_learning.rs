@@ -21,44 +21,42 @@ pub fn string_similarity(word1: &str, word2: &str) -> u8 {
     result
 }
 fn index_of_most_similar_section(sections: &[Vec<Text>], memory: &[String]) -> usize {
-    let mut scores: Vec<(u8, usize)> = Vec::with_capacity(sections.len());
+    // u64: the old u8 silently wrapped after ~3 word comparisons in release mode,
+    // turning section scoring into noise. Per-word similarity still returns u8.
+    let mut scores: Vec<(u64, usize)> = Vec::with_capacity(sections.len());
 
     for (section_index, section) in sections.iter().enumerate() {
-        let mut section_score: u8 = 0;
+        let mut section_score: u64 = 0;
         let mut words_in_section: Vec<String> = Vec::new();
 
-        // Goes through every word in every texts and adds to a vec
         for text in section {
-            match text {
-                Text::User(s) => {
-                    for word in s.split_whitespace() {
-                        words_in_section.push(word.to_string());
-                    }
+            if let Text::User(s) = text {
+                for word in s.split_whitespace() {
+                    words_in_section.push(word.to_string());
                 }
-                Text::Bot(_) => { }
             }
-        }
-        
-        for (i, word) in words_in_section.iter().enumerate() {
-            // will panic if memory[i] is out of bounds, fix is to make it break out of loop if
-            // error
-            if let Some(mem_word) = memory.get(i) {
-                section_score += string_similarity(word.as_str(), mem_word);
-            }
-            else { break; }
         }
 
-        //scores[section_index] = (section_score, section_index);
+        for (i, word) in words_in_section.iter().enumerate() {
+            if let Some(mem_word) = memory.get(i) {
+                section_score += string_similarity(word.as_str(), mem_word) as u64;
+            } else {
+                break;
+            }
+        }
+
         scores.push((section_score, section_index));
     }
-    
-    // Go through all scores and find the one with the highest, 
-    let mut highscore: u8 = 0;
+
+    let mut highscore: u64 = 0;
     let mut idx_of_highest: usize = 0;
     for (sec_score, sec_idx) in scores {
-        if sec_score > highscore { highscore = sec_score; idx_of_highest = sec_idx; }
+        if sec_score > highscore {
+            highscore = sec_score;
+            idx_of_highest = sec_idx;
+        }
     }
-    idx_of_highest 
+    idx_of_highest
 }
 pub fn teacher_response(dialog: &Data, bot_memory: &[String], user_input: &str) -> String {
     // Skip empty sections so we never land on dialogs::load's leading empty section.

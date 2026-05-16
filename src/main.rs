@@ -1,40 +1,90 @@
-mod dialogs;
-mod embeddings;
-mod gpu;
-mod machine_learning;
-mod memory;
-mod neural_network;
-mod teacher;
-
-use crate::dialogs::Data;
-use crate::gpu::Gpu;
-use crate::neural_network::{generate, generate_and_train, network_init};
+use rust_fun::dialogs::Data;
+use rust_fun::gpu::Gpu;
+use rust_fun::memory;
+use rust_fun::neural_network::{
+    HIDDEN_SIZE, NUMBER_OF_HIDDEN_LAYERS, generate, generate_and_train, input_size_for,
+    network_init, pretrain,
+};
+use rust_fun::persist::{self, LoadedShape};
 use std::io::{self, Write};
 use std::time::Instant;
 
+const MODEL_PATH: &str = "model.bin";
+const PRETRAIN_EPOCHS: usize = 3;
+const PRETRAIN_LR: f32 = 0.05;
+const ONLINE_LR: f32 = 0.02;
+const SAVE_EVERY_N_TURNS: usize = 5;
+
 fn main() -> anyhow::Result<()> {
-    let train: bool = true;
-    let mut output = String::new();
-    let mut input = String::new();
     let mut talking = true;
     let mut bot_memory: Vec<String> = Vec::new();
 
     println!("Hey, welcome to SuperSighurt LLM-mode!");
 
     let gpu = Gpu::new()?;
-    println!("GPU backend: {}", gpu.ctx.device_name());
+    println!("Backend: {}", gpu.device_name());
 
-    // Dialogs first: loading them can extend vocab.txt with new words. Then snapshot
-    // the vocab so the network's output size matches what we will ever index into.
     let mut dialog: Data = Data::new();
     dialog.load();
     let words_in_vocab = memory::load();
     println!("Vocab size: {}", words_in_vocab.len());
 
-    let hidden_size: usize = 10000;
+    let hidden_size: usize = HIDDEN_SIZE;
+    let hidden_layers: usize = NUMBER_OF_HIDDEN_LAYERS;
     let output_size: usize = words_in_vocab.len();
-    let mut net = network_init(&gpu, hidden_size, output_size)?;
-    let lr: f32 = 0.1;
+    let input_size: usize = input_size_for(words_in_vocab.len());
+
+    let shape = LoadedShape {
+        input_size,
+        vocab_size: output_size,
+        hidden_size,
+        hidden_layers,
+    };
+
+    let mut net = match persist::load(MODEL_PATH, &gpu, shape) {
+        Ok(Some(n)) => {
+            println!("Loaded saved model from {}", MODEL_PATH);
+            n
+        }
+        Ok(None) => {
+            println!(
+                "No saved model at {}. Initializing fresh network ({} hidden layers x {} units).",
+                MODEL_PATH, hidden_layers, hidden_size
+            );
+            let mut net = network_init(&gpu, input_size, hidden_size, hidden_layers, output_size)?;
+            println!("Pretraining on dialog corpus ({} epochs)...", PRETRAIN_EPOCHS);
+            let t0 = Instant::now();
+            pretrain(&gpu, &mut net, &dialog, &words_in_vocab, PRETRAIN_LR, PRETRAIN_EPOCHS)?;
+            println!(
+                "Pretraining done in {:.2}s. Saving initial weights.",
+                t0.elapsed().as_secs_f64()
+            );
+            persist::save(&net, MODEL_PATH)?;
+            net
+        }
+        Err(e) => {
+            println!(
+                "Could not load saved model ({}). Initializing fresh and pretraining.",
+                e
+            );
+            let mut net = network_init(&gpu, input_size, hidden_size, hidden_layers, output_size)?;
+            let t0 = Instant::now();
+            pretrain(&gpu, &mut net, &dialog, &words_in_vocab, PRETRAIN_LR, PRETRAIN_EPOCHS)?;
+            println!(
+                "Pretraining done in {:.2}s. Saving initial weights.",
+                t0.elapsed().as_secs_f64()
+            );
+            persist::save(&net, MODEL_PATH)?;
+            net
+        }
+    };
+
+    let mut turns_since_save = 0usize;
+    let mut output = String::new();
+    let mut input = String::new();
+
+    println!("Type ':q' to quit, ':save' to checkpoint, ':train off|on' to toggle.");
+    let mut train_active = true;
 
     while talking {
         if !output.trim().is_empty() {
@@ -45,19 +95,34 @@ fn main() -> anyhow::Result<()> {
             io::stdout().flush().unwrap();
 
             input.clear();
-            std::io::stdin()
-                .read_line(&mut input)
-                .expect("failed to read");
+            std::io::stdin().read_line(&mut input).expect("failed to read");
             input = input.trim().to_string();
 
             if input == ":q" {
                 talking = false;
                 continue;
             }
-            bot_memory.push(input.clone());
+            if input == ":save" {
+                persist::save(&net, MODEL_PATH)?;
+                println!("[saved to {}]", MODEL_PATH);
+                continue;
+            }
+            if input == ":train off" {
+                train_active = false;
+                println!("[training disabled]");
+                continue;
+            }
+            if input == ":train on" {
+                train_active = true;
+                println!("[training enabled]");
+                continue;
+            }
+            if input.is_empty() {
+                continue;
+            }
 
             let start = Instant::now();
-            let sentence = if train {
+            let sentence = if train_active {
                 generate_and_train(
                     &gpu,
                     &mut net,
@@ -65,18 +130,28 @@ fn main() -> anyhow::Result<()> {
                     &bot_memory,
                     &words_in_vocab,
                     &dialog,
-                    lr,
+                    ONLINE_LR,
                 )?
             } else {
                 generate(&gpu, &mut net, &input, &bot_memory, &words_in_vocab)?
             };
             println!(
-                "Time to get answer in seconds: {:?}",
+                "Time to get answer in seconds: {:.3}",
                 start.elapsed().as_secs_f64()
             );
-            output = sentence;
+            output = sentence.clone();
+            bot_memory.push(input.clone());
+            bot_memory.push(sentence);
+
+            turns_since_save += 1;
+            if train_active && turns_since_save >= SAVE_EVERY_N_TURNS {
+                persist::save(&net, MODEL_PATH)?;
+                turns_since_save = 0;
+            }
         }
     }
 
+    persist::save(&net, MODEL_PATH)?;
+    println!("Model saved to {}.", MODEL_PATH);
     Ok(())
 }

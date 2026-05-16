@@ -1,74 +1,45 @@
-use crate::neural_network::Network;
-use rand::Rng;
-use std::collections::HashSet;
+use crate::neural_network::{Activation, Network};
 
-/// Per-step negative samples for output-layer training. The multi-output sigmoid
-/// design pulls *every* off-class activation toward 0 each step, which on a vocab
-/// of thousands drowns out the single "should fire" signal. Sampling a handful of
-/// negatives keeps the signal balanced without changing the architecture.
-const NEG_SAMPLES: usize = 16;
-
-fn output_delta_sigmoid(error: f32, activation: f32) -> f32 {
-    let slope = activation * (1.0 - activation);
-    error * slope
-}
-
-pub fn word_change_delta(
-    teacher_word: &str,
-    vocab: &[String],
-    net: &Network,
-) -> Option<Vec<Vec<f32>>> {
-    let teacher_word_idx = vocab.iter().position(|w| w == teacher_word)?;
-    let lcount = net.layers.len();
-
+/// Standard softmax + cross-entropy backprop. The output layer's cached
+/// `last_activations` already hold post-softmax probabilities, so the output
+/// delta collapses to (p - one_hot[target]). Hidden layers use tanh', i.e.
+/// 1 - a^2 where a is the cached tanh activation.
+pub fn compute_deltas(net: &Network, target_idx: usize) -> Vec<Vec<f32>> {
+    let n = net.layers.len();
     let mut deltas: Vec<Vec<f32>> = net
         .layers
         .iter()
-        .map(|layer| vec![0.0f32; layer.cache.len()])
+        .map(|l| vec![0.0f32; l.last_activations.len()])
         .collect();
 
-    // Output layer: positive target on the teacher word; pull a small random set
-    // of negatives toward 0. All other output neurons get zero gradient this step.
-    let out = lcount - 1;
-    let mut negatives: HashSet<usize> = HashSet::with_capacity(NEG_SAMPLES);
-    if vocab.len() > 1 {
-        let mut rng = rand::thread_rng();
-        let target_neg = NEG_SAMPLES.min(vocab.len() - 1);
-        while negatives.len() < target_neg {
-            let n = rng.gen_range(0..vocab.len());
-            if n != teacher_word_idx {
-                negatives.insert(n);
-            }
-        }
-    }
-    for (i, n_cache) in net.layers[out].cache.iter().enumerate() {
-        if i == teacher_word_idx {
-            let error = 1.0 - n_cache.activation;
-            deltas[out][i] = output_delta_sigmoid(error, n_cache.activation);
-        } else if negatives.contains(&i) {
-            let error = -n_cache.activation;
-            deltas[out][i] = output_delta_sigmoid(error, n_cache.activation);
-        }
+    // Output layer: delta = softmax - one_hot
+    let out_acts = &net.layers[n - 1].last_activations;
+    for i in 0..out_acts.len() {
+        let t = if i == target_idx { 1.0 } else { 0.0 };
+        deltas[n - 1][i] = out_acts[i] - t;
     }
 
-    // Hidden layers backward, using split_at_mut to avoid borrow conflict on `deltas`.
-    for layer_idx in (0..out).rev() {
-        let (deltas_left, deltas_right) = deltas.split_at_mut(layer_idx + 1);
-        let curr_deltas = &mut deltas_left[layer_idx];
-        let next_deltas = &deltas_right[0];
-
-        let next_layer = &net.layers[layer_idx + 1];
+    // Backprop through hidden layers
+    for li in (0..n - 1).rev() {
+        let next_layer = &net.layers[li + 1];
         let next_cols = next_layer.cols;
+        let acts = &net.layers[li].last_activations;
+        let (left, right) = deltas.split_at_mut(li + 1);
+        let curr = &mut left[li];
+        let next_d = &right[0];
 
-        for (j, n_cache) in net.layers[layer_idx].cache.iter().enumerate() {
-            let mut weighted_sum = 0.0f32;
-            for k in 0..next_deltas.len() {
-                weighted_sum += next_layer.weights[k * next_cols + j] * next_deltas[k];
+        for j in 0..curr.len() {
+            let mut sum = 0.0f32;
+            for k in 0..next_d.len() {
+                sum += next_layer.weights[k * next_cols + j] * next_d[k];
             }
-            let slope = n_cache.activation * (1.0 - n_cache.activation);
-            curr_deltas[j] = weighted_sum * slope;
+            let slope = match net.layers[li].activation {
+                Activation::Tanh => 1.0 - acts[j] * acts[j],
+                Activation::Linear => 1.0,
+            };
+            curr[j] = sum * slope;
         }
     }
 
-    Some(deltas)
+    deltas
 }
