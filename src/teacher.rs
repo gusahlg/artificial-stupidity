@@ -3,10 +3,19 @@ use rayon::prelude::*;
 
 /// Per-layer post-activation gradients **plus** the gradient with respect to
 /// the network's input vector, so the embedding layer can receive its share.
-pub struct BackpropOutput {
+///
+/// Reused across training steps via `Network::backprop_scratch` to avoid
+/// the ~600k Vec allocations/free per epoch we used to do when this was
+/// returned by value from `compute_deltas`.
+#[derive(Default)]
+pub struct BackpropScratch {
     pub layer_deltas: Vec<Vec<f32>>,
     pub input_grad: Vec<f32>,
 }
+
+/// Compatibility alias for legacy callers. New code uses `BackpropScratch`
+/// and the in-place `compute_deltas_into`.
+pub type BackpropOutput = BackpropScratch;
 
 /// Standard softmax + cross-entropy backprop. Output layer delta collapses to
 /// (softmax - one_hot); hidden layers use tanh' = 1 - a². Finally we compute
@@ -25,13 +34,38 @@ pub struct BackpropOutput {
 /// weight matrix it touches in stride pattern) into L2 cache. With
 /// `BACKWARD_CHUNK = 32` and worst-case `rows = 3029`, each thread sees
 /// `3029 × 32 × 4 = ~388 KB` of weights — sized for typical L2 caches.
+/// Allocating wrapper kept for callers that don't have a pre-allocated
+/// scratch buffer (tests, one-shot tools). Hot paths should call
+/// `compute_deltas_into` with a reused `BackpropScratch`.
 pub fn compute_deltas(net: &Network, target_idx: usize) -> BackpropOutput {
+    let mut scratch = BackpropScratch::default();
+    compute_deltas_into(net, target_idx, &mut scratch);
+    scratch
+}
+
+/// In-place backward pass. The caller provides a `BackpropScratch` whose
+/// buffers we resize to match net dimensions (cheap if already correct).
+/// All writes go into `scratch`; we return nothing.
+pub fn compute_deltas_into(net: &Network, target_idx: usize, scratch: &mut BackpropScratch) {
     let n = net.layers.len();
-    let mut layer_deltas: Vec<Vec<f32>> = net
-        .layers
-        .iter()
-        .map(|l| vec![0.0f32; l.last_activations.len()])
-        .collect();
+    // Resize scratch to current layer geometry. Vec::resize is cheap when
+    // dimensions are already correct (no reallocation) and pads with 0.0
+    // when growing, which is what we want before the output-layer write.
+    if scratch.layer_deltas.len() != n {
+        scratch.layer_deltas.resize_with(n, Default::default);
+    }
+    for (i, layer) in net.layers.iter().enumerate() {
+        let need = layer.last_activations.len();
+        if scratch.layer_deltas[i].len() != need {
+            scratch.layer_deltas[i].clear();
+            scratch.layer_deltas[i].resize(need, 0.0);
+        } else {
+            // Zero in place; the output-layer write overwrites this fully
+            // anyway, but hidden layers' chunked writes need a clean start.
+            scratch.layer_deltas[i].fill(0.0);
+        }
+    }
+    let layer_deltas = &mut scratch.layer_deltas;
 
     // Output layer: softmax - one_hot.
     let out_acts = &net.layers[n - 1].last_activations;
@@ -91,7 +125,11 @@ pub fn compute_deltas(net: &Network, target_idx: usize) -> BackpropOutput {
     let rows = l0.rows;
     let l0_w = &l0.weights;
     let d0: &[f32] = &layer_deltas[0];
-    let mut input_grad = vec![0.0f32; cols];
+    if scratch.input_grad.len() != cols {
+        scratch.input_grad.clear();
+        scratch.input_grad.resize(cols, 0.0);
+    }
+    let input_grad = &mut scratch.input_grad;
     input_grad
         .par_chunks_mut(BACKWARD_CHUNK)
         .enumerate()
@@ -112,11 +150,6 @@ pub fn compute_deltas(net: &Network, target_idx: usize) -> BackpropOutput {
                 }
             }
         });
-
-    BackpropOutput {
-        layer_deltas,
-        input_grad,
-    }
 }
 
 /// Chunk size for the cache-friendly backward. 32 floats per chunk means a

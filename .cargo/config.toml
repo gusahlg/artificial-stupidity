@@ -1,0 +1,7 @@
+# Compile for the local CPU. Required for `wide::f32x8` to lower to AVX2 (or
+# AVX-512 on newer machines) instead of falling back to SSE / scalar code.
+# Without this the SIMD optimization in src/neural_network.rs Adam loop is
+# effectively wasted. Builds produced with this config are not portable to
+# other CPU families — but the desktop is the only training host.
+[build]
+rustflags = ["-C", "target-cpu=native"]

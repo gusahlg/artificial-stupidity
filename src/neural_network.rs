@@ -246,6 +246,11 @@ pub struct Network {
     /// Adam time-step counter. Not persisted — bias correction is stable
     /// after a handful of steps anyway, so a fresh counter on resume is fine.
     pub adam_step: u64,
+    /// Reusable backward-pass buffers. Held on the network so we don't
+    /// allocate per training step. `train_step` `mem::take`s this out so
+    /// it can pass `&Network` + `&mut scratch` separately past the borrow
+    /// checker, then puts it back when done.
+    pub backprop_scratch: crate::teacher::BackpropScratch,
 }
 
 fn softmax_inplace(x: &mut [f32]) {
@@ -326,7 +331,12 @@ impl Network {
         let bc1 = (1.0 - ADAM_BETA1.powi(step)).max(1e-12);
         let bc2 = (1.0 - ADAM_BETA2.powi(step)).max(1e-12);
 
-        let bp = compute_deltas(self, target_idx);
+        // Move scratch out so we can pass `&Network` (for reads) and
+        // `&mut BackpropScratch` (for writes) as disjoint borrows. Returned
+        // at end of function.
+        let mut scratch = std::mem::take(&mut self.backprop_scratch);
+        crate::teacher::compute_deltas_into(self, target_idx, &mut scratch);
+        let bp = &scratch;
         for (idx, layer) in self.layers.iter_mut().enumerate() {
             let d = &bp.layer_deltas[idx];
             let cols = layer.cols;
@@ -424,6 +434,9 @@ impl Network {
             WEIGHT_DECAY,
             self.adam_step,
         );
+
+        // Return scratch buffers to the network for the next call to reuse.
+        self.backprop_scratch = scratch;
     }
 }
 
@@ -544,6 +557,7 @@ pub fn network_init(
         embed_dim,
         context_window,
         adam_step: 0,
+        backprop_scratch: crate::teacher::BackpropScratch::default(),
     })
 }
 

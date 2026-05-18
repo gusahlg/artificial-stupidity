@@ -202,5 +202,6 @@ pub fn load<P: AsRef<Path>>(
         embed_dim,
         context_window,
         adam_step: 0,
+        backprop_scratch: crate::teacher::BackpropScratch::default(),
     }))
 }
