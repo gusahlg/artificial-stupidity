@@ -84,25 +84,22 @@ impl LayerGpu {
     }
 }
 
-/// y = W @ x where W is [rows, cols] row-major. CPU path: straightforward
-/// triple-loop, but treats x as effectively sparse so the (mostly-zero)
-/// bag-of-words input layer doesn't waste cycles.
+/// y = W @ x where W is [rows, cols] row-major. CPU path: rayon-parallel
+/// per output row, each row a small contiguous dot product. Dense input
+/// (the BoW path is gone) so we no longer branch on x[k]==0.
 pub fn cpu_matvec(weights: &[f32], rows: usize, cols: usize, x: &[f32], y: &mut [f32]) {
+    use rayon::prelude::*;
     debug_assert_eq!(weights.len(), rows * cols);
     debug_assert_eq!(x.len(), cols);
     debug_assert_eq!(y.len(), rows);
-    for j in 0..rows {
+    y.par_iter_mut().enumerate().for_each(|(j, out)| {
         let row = &weights[j * cols..(j + 1) * cols];
         let mut acc = 0.0f32;
         for k in 0..cols {
-            // Branch is predictable for the long zero runs in our BoW input.
-            let v = x[k];
-            if v != 0.0 {
-                acc += row[k] * v;
-            }
+            acc += row[k] * x[k];
         }
-        y[j] = acc;
-    }
+        *out = acc;
+    });
 }
 
 impl Gpu {

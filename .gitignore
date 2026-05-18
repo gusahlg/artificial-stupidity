@@ -1,1 +1,8 @@
 /target
+/data/discord/
+/data/embeddings.db
+/data/embeddings.db-journal
+/data/embeddings.db-wal
+/data/embeddings.db-shm
+/.pi-stage/
+/training.log

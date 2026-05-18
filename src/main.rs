@@ -24,8 +24,7 @@ fn main() -> anyhow::Result<()> {
     let gpu = Gpu::new()?;
     println!("Backend: {}", gpu.device_name());
 
-    let mut dialog: Data = Data::new();
-    dialog.load();
+    let dialog: Data = Data::load()?;
     let vocab = dialog.build_vocab();
     memory::save_vocab(&vocab);
     println!("Vocab size: {}", vocab.len());

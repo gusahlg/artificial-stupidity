@@ -5,8 +5,8 @@ use rust_fun::dialogs::Data;
 use rust_fun::gpu::Gpu;
 use rust_fun::memory;
 use rust_fun::neural_network::{
-    CONTEXT_WINDOW, EMBED_DIM, HIDDEN_SIZE, NUMBER_OF_HIDDEN_LAYERS, extract_train_pairs, generate,
-    network_init, train_one_epoch,
+    CONTEXT_WINDOW, EMBED_DIM, HIDDEN_SIZE, NUMBER_OF_HIDDEN_LAYERS, extract_train_examples,
+    generate, network_init, train_one_epoch,
 };
 use rust_fun::persist::{self, LoadedShape};
 use std::time::Instant;
@@ -63,14 +63,34 @@ impl Args {
 fn main() -> Result<()> {
     let args = Args::parse();
 
-    let gpu = Gpu::new()?;
+    // Try GPU first; the bumped model + larger corpus crosses the threshold
+    // where Vulkan dispatch overhead pays off against the rayon CPU matmul.
+    // Override with `SIGHURT_TRAIN_CPU=1` to fall back to CPU if your GPU
+    // path regresses for some reason.
+    let force_cpu = std::env::var("SIGHURT_TRAIN_CPU")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    let gpu = if force_cpu {
+        Gpu::new_cpu()
+    } else {
+        match Gpu::new() {
+            Ok(g) => g,
+            Err(e) => {
+                eprintln!("GPU init failed ({}); falling back to CPU.", e);
+                Gpu::new_cpu()
+            }
+        }
+    };
     println!("Auto-trainer starting. Backend: {}", gpu.device_name());
 
-    let mut dialog = Data::new();
-    dialog.load();
+    let dialog = Data::load()?;
     let vocab = dialog.build_vocab();
     memory::save_vocab(&vocab);
-    println!("Vocab size: {}", vocab.len());
+    println!(
+        "Vocab size: {} (max PERSON id: {})",
+        vocab.len(),
+        dialog.max_person_id().map(|n| n as i64).unwrap_or(-1)
+    );
 
     let shape = LoadedShape {
         embed_dim: EMBED_DIM,
@@ -109,16 +129,22 @@ fn main() -> Result<()> {
         }
     };
 
-    let mut pairs = extract_train_pairs(&dialog);
-    let total = pairs.len();
+    let mut examples = extract_train_examples(&dialog);
+    let total = examples.len();
+    if total < 2 {
+        anyhow::bail!(
+            "corpus has only {} training example(s); need at least 2 for train/val split",
+            total
+        );
+    }
     let val_n = ((total as f32) * args.val_frac).round() as usize;
     let val_n = val_n.max(1).min(total.saturating_sub(1));
-    let val_pairs: Vec<_> = pairs.split_off(total - val_n);
+    let val_examples: Vec<_> = examples.split_off(total - val_n);
     println!(
-        "Extracted {} pairs total -> {} train / {} val.",
+        "Extracted {} examples total -> {} train / {} val.",
         total,
-        pairs.len(),
-        val_pairs.len()
+        examples.len(),
+        val_examples.len()
     );
 
     let sample_prompts = [
@@ -135,8 +161,8 @@ fn main() -> Result<()> {
         let stats = train_one_epoch(
             &gpu,
             &mut net,
-            &mut pairs,
-            &val_pairs,
+            &mut examples,
+            &val_examples,
             &vocab,
             lr,
             args.prelude_drop,

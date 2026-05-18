@@ -1,12 +1,16 @@
-//! Teacher response lookup.
+//! Teacher response lookup, person-agnostic.
 //!
-//! Section selection (which conversation block resembles the current
-//! conversation history) intentionally stays on the char-based heuristic.
-//! User-line selection within a section now uses cosine similarity over
-//! embedding centroids supplied by the caller, which gives semantic
-//! matching instead of literal character overlap.
+//! Two-stage match:
+//!   1. Section selection — char-similarity heuristic over every turn's
+//!      tokens (not filtered by speaker).
+//!   2. Nearest turn within that section by cosine similarity over
+//!      embedding centroids supplied by the caller, again ignoring speaker.
+//!
+//! Returns the tokens of the turn IMMEDIATELY FOLLOWING the best match,
+//! regardless of who wrote it. The model treats that as the supervised
+//! template for what to say next.
 
-use crate::dialogs::{Data, Text};
+use crate::dialogs::{Data, Turn};
 use crate::embeddings::cosine;
 
 pub fn string_similarity(word1: &str, word2: &str) -> u8 {
@@ -27,15 +31,13 @@ pub fn string_similarity(word1: &str, word2: &str) -> u8 {
     result
 }
 
-fn index_of_most_similar_section(sections: &[Vec<Text>], memory_tokens: &[String]) -> usize {
+fn index_of_most_similar_section(sections: &[Vec<Turn>], memory_tokens: &[String]) -> usize {
     let mut best = 0usize;
     let mut best_score: u64 = 0;
     for (sec_idx, section) in sections.iter().enumerate() {
         let mut section_words: Vec<&String> = Vec::new();
-        for text in section {
-            if let Text::User(toks) = text {
-                section_words.extend(toks.iter());
-            }
+        for turn in section {
+            section_words.extend(turn.tokens.iter());
         }
         let mut score: u64 = 0;
         for (i, word) in section_words.iter().enumerate() {
@@ -53,10 +55,10 @@ fn index_of_most_similar_section(sections: &[Vec<Text>], memory_tokens: &[String
     best
 }
 
-/// `embed_centroid` should map a token list to a fixed-length embedding-
-/// centroid vector (e.g. via `Embedding::centroid` after id lookup). Returns
-/// the bot reply (as tokens) immediately following the best-matching user
-/// line in the best-matching section. Empty Vec on failure.
+/// `embed_centroid` maps a token list to a fixed-length vector (e.g. via
+/// `Embedding::centroid` after id lookup). Returns the tokens of the next
+/// turn after the best-matching one in the best-matching section. Empty Vec
+/// on failure (no sections, best match has no successor, etc).
 pub fn teacher_response<F>(
     dialog: &Data,
     bot_memory_tokens: &[String],
@@ -66,7 +68,7 @@ pub fn teacher_response<F>(
 where
     F: Fn(&[String]) -> Vec<f32>,
 {
-    let candidates: Vec<&Vec<Text>> = dialog
+    let candidates: Vec<&Vec<Turn>> = dialog
         .sections
         .iter()
         .filter(|s| !s.is_empty())
@@ -74,29 +76,27 @@ where
     if candidates.is_empty() {
         return Vec::new();
     }
-    let sections_owned: Vec<Vec<Text>> = candidates.iter().map(|s| (*s).clone()).collect();
+    let sections_owned: Vec<Vec<Turn>> = candidates.iter().map(|s| (*s).clone()).collect();
     let sec_idx = index_of_most_similar_section(&sections_owned, bot_memory_tokens);
     let section = &sections_owned[sec_idx];
 
     let query = embed_centroid(user_input_tokens);
 
     let mut best: Option<(f32, usize)> = None;
-    for (i, text) in section.iter().enumerate() {
-        if let Text::User(toks) = text {
-            let cand = embed_centroid(toks);
-            let sim = cosine(&query, &cand);
-            best = Some(match best {
-                Some((b, _)) if b >= sim => best.unwrap(),
-                _ => (sim, i),
-            });
+    for (i, turn) in section.iter().enumerate() {
+        if turn.tokens.is_empty() {
+            continue;
         }
+        let cand = embed_centroid(&turn.tokens);
+        let sim = cosine(&query, &cand);
+        best = Some(match best {
+            Some((b, _)) if b >= sim => best.unwrap(),
+            _ => (sim, i),
+        });
     }
 
     match best {
-        Some((_, idx)) if idx + 1 < section.len() => match &section[idx + 1] {
-            Text::Bot(toks) => toks.clone(),
-            _ => Vec::new(),
-        },
+        Some((_, idx)) if idx + 1 < section.len() => section[idx + 1].tokens.clone(),
         _ => Vec::new(),
     }
 }

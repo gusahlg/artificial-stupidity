@@ -201,5 +201,6 @@ pub fn load<P: AsRef<Path>>(
         hidden_layers,
         embed_dim,
         context_window,
+        adam_step: 0,
     }))
 }

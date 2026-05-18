@@ -1,32 +1,21 @@
-//! Trainable word embedding table.
-//!
-//! `weights` is a `vocab_size × embed_dim` row-major matrix. `forward`
-//! concatenates the rows for a given token-ID window into one flat vector,
-//! which feeds the dense network. `apply_grad` updates only the rows that
-//! were actually used in the last forward, with SGD + momentum + L2.
+//! Trainable word embedding table with Adam optimizer state.
 
 use rand::Rng;
 use std::collections::HashMap;
 
-/// Token IDs whose embedding rows are frozen (never updated). PAD=0 is a
-/// padding sentinel — letting it drift makes the input layer's "no history
-/// yet" signal noisy and tends to destabilize early training.
-const FROZEN_IDS: &[usize] = &[0];
+const FROZEN_IDS: &[usize] = &[0]; // PAD frozen
 
 pub struct Embedding {
     pub weights: Vec<f32>,
-    pub velocities: Vec<f32>,
+    pub m: Vec<f32>, // Adam first moment
+    pub v: Vec<f32>, // Adam second moment
     pub vocab_size: usize,
     pub embed_dim: usize,
     pub last_token_ids: Vec<usize>,
 }
 
 impl Embedding {
-    pub fn new(
-        vocab_size: usize,
-        embed_dim: usize,
-        rng: &mut rand::rngs::ThreadRng,
-    ) -> Self {
+    pub fn new(vocab_size: usize, embed_dim: usize, rng: &mut rand::rngs::ThreadRng) -> Self {
         let n = vocab_size * embed_dim;
         let bound = (1.0f32 / embed_dim as f32).sqrt();
         let mut weights = Vec::with_capacity(n);
@@ -40,7 +29,8 @@ impl Embedding {
             }
         }
         Self {
-            velocities: vec![0.0; n],
+            m: vec![0.0; n],
+            v: vec![0.0; n],
             weights,
             vocab_size,
             embed_dim,
@@ -51,7 +41,8 @@ impl Embedding {
     pub fn from_parts(vocab_size: usize, embed_dim: usize, weights: Vec<f32>) -> Self {
         let n = weights.len();
         Self {
-            velocities: vec![0.0; n],
+            m: vec![0.0; n],
+            v: vec![0.0; n],
             weights,
             vocab_size,
             embed_dim,
@@ -64,10 +55,6 @@ impl Embedding {
         &self.weights[start..start + self.embed_dim]
     }
 
-    /// Concatenate the rows for `token_ids` into one flat vector of length
-    /// `token_ids.len() * embed_dim`. When `cache` is true, the IDs are
-    /// stored so the backward pass can attribute the gradient to the right
-    /// rows.
     pub fn forward(&mut self, token_ids: &[usize], cache: bool) -> Vec<f32> {
         let d = self.embed_dim;
         let mut out = Vec::with_capacity(token_ids.len() * d);
@@ -82,13 +69,19 @@ impl Embedding {
         out
     }
 
-    /// `grad` is laid out exactly like the output of `forward`: one
-    /// `embed_dim`-wide block per token. When the same id appears multiple
-    /// times in the window (typical for PAD at the start of a sequence), we
-    /// SUM the per-occurrence gradients into a single update for that row —
-    /// applying them as separate momentum updates would multiply the effect
-    /// by the number of occurrences and blow the row up.
-    pub fn apply_grad(&mut self, grad: &[f32], lr: f32, momentum: f32, weight_decay: f32) {
+    /// AdamW update for the (small set of) embedding rows that were touched
+    /// during the last forward. Duplicates in the window have their gradient
+    /// contributions summed into a single row update.
+    pub fn apply_grad_adam(
+        &mut self,
+        grad: &[f32],
+        lr: f32,
+        beta1: f32,
+        beta2: f32,
+        eps: f32,
+        weight_decay: f32,
+        step: u64,
+    ) {
         let d = self.embed_dim;
         debug_assert_eq!(grad.len(), self.last_token_ids.len() * d);
 
@@ -103,21 +96,29 @@ impl Embedding {
                 entry[k] += grad[src + k];
             }
         }
+
+        let bc1 = 1.0 - beta1.powi(step as i32);
+        let bc2 = 1.0 - beta2.powi(step as i32);
+        let bc1 = bc1.max(1e-12);
+        let bc2 = bc2.max(1e-12);
+
         for (id, g) in accum {
             let dst = id * d;
             for k in 0..d {
-                let v = (momentum * self.velocities[dst + k] + g[k]).clamp(-5.0, 5.0);
-                self.velocities[dst + k] = v;
+                let gk = g[k];
+                let m_new = beta1 * self.m[dst + k] + (1.0 - beta1) * gk;
+                let v_new = beta2 * self.v[dst + k] + (1.0 - beta2) * gk * gk;
+                self.m[dst + k] = m_new;
+                self.v[dst + k] = v_new;
+                let m_hat = m_new / bc1;
+                let v_hat = v_new / bc2;
                 let mut w = self.weights[dst + k];
-                w -= lr * v;
-                w -= lr * weight_decay * w;
+                w -= lr * (m_hat / (v_hat.sqrt() + eps) + weight_decay * w);
                 self.weights[dst + k] = w;
             }
         }
     }
 
-    /// Append fresh random rows so the table covers `new_vocab_size` tokens.
-    /// No-op if it's already big enough; never shrinks.
     pub fn extend_to(&mut self, new_vocab_size: usize, rng: &mut rand::rngs::ThreadRng) {
         if new_vocab_size <= self.vocab_size {
             return;
@@ -128,13 +129,11 @@ impl Embedding {
         for _ in 0..extra {
             self.weights.push(rng.gen_range(-bound..bound));
         }
-        self.velocities.resize(self.velocities.len() + extra, 0.0);
+        self.m.resize(self.m.len() + extra, 0.0);
+        self.v.resize(self.v.len() + extra, 0.0);
         self.vocab_size = new_vocab_size;
     }
 
-    /// Mean-pool embeddings for the given token IDs, skipping PAD (0) and
-    /// UNK (1) so empty / unknown queries don't drown out signal. Returns a
-    /// zero vector if nothing matched.
     pub fn centroid(&self, token_ids: &[usize]) -> Vec<f32> {
         let d = self.embed_dim;
         let mut out = vec![0.0f32; d];
