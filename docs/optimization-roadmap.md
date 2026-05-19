@@ -1,6 +1,6 @@
 # Training-speed optimization roadmap
 
-A survey of viable optimizations for the SuperSighurt training pipeline.
+A survey of viable optimizations for the artificial-stupidity training pipeline.
 None are implemented yet (this is the "things worth doing later" list); the
 table at the bottom ranks them by expected payoff vs effort.
 

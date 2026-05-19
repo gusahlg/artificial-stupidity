@@ -21,6 +21,13 @@ struct Args {
     sample_every: usize,
     lr_decay: f32,
     val_frac: f32,
+    /// Optional cap on the training pool size, applied AFTER the train/val
+    /// split. Useful for short benchmark runs (e.g. `--max-train-examples 50`
+    /// finishes a "fake epoch" in seconds for timing).
+    max_train_examples: Option<usize>,
+    /// Optional cap on the validation pool size, applied AFTER the split.
+    /// Same purpose as `--max-train-examples` but for the validation pass.
+    max_val_examples: Option<usize>,
 }
 
 impl Args {
@@ -33,6 +40,8 @@ impl Args {
             sample_every: 5,
             lr_decay: 0.985,
             val_frac: 0.1,
+            max_train_examples: None,
+            max_val_examples: None,
         };
         let mut it = std::env::args().skip(1);
         while let Some(flag) = it.next() {
@@ -44,9 +53,15 @@ impl Args {
                 "--sample-every" => a.sample_every = it.next().unwrap().parse().unwrap(),
                 "--lr-decay" => a.lr_decay = it.next().unwrap().parse().unwrap(),
                 "--val-frac" => a.val_frac = it.next().unwrap().parse().unwrap(),
+                "--max-train-examples" => {
+                    a.max_train_examples = Some(it.next().unwrap().parse().unwrap())
+                }
+                "--max-val-examples" => {
+                    a.max_val_examples = Some(it.next().unwrap().parse().unwrap())
+                }
                 "--help" | "-h" => {
                     println!(
-                        "train [--epochs N] [--lr F] [--save-every N] [--prelude-drop F] [--sample-every N] [--lr-decay F] [--val-frac F]"
+                        "train [--epochs N] [--lr F] [--save-every N] [--prelude-drop F] [--sample-every N] [--lr-decay F] [--val-frac F] [--max-train-examples N] [--max-val-examples N]"
                     );
                     std::process::exit(0);
                 }
@@ -63,16 +78,19 @@ impl Args {
 fn main() -> Result<()> {
     let args = Args::parse();
 
-    // Try GPU first; the bumped model + larger corpus crosses the threshold
-    // where Vulkan dispatch overhead pays off against the rayon CPU matmul.
-    // Override with `SIGHURT_TRAIN_CPU=1` to fall back to CPU if your GPU
-    // path regresses for some reason.
-    let force_cpu = std::env::var("SIGHURT_TRAIN_CPU")
+    // Default to CPU. The 2026-05 SIGHURT_TIME_STEPS profiling showed the
+    // CPU rayon matmul beats Vulkan by ~5.5× per step on this model size:
+    //   GPU:  fwd 13.5ms  back 8.5ms   adam 2.1ms   = 24.2 ms/step
+    //   CPU:  fwd 1.1ms   back 2.2ms   adam 1.6ms   =  4.9 ms/step
+    // The hidden layers are only 768×768 and Vulkan dispatch overhead
+    // (~2-3 ms per matvec call, × 5 layers × per-token) dominates the
+    // actual matmul math. GPU only pays off once we batch matmuls big
+    // enough to amortize dispatch — i.e. once mini-batch training lands.
+    // Opt back into GPU with `SIGHURT_TRAIN_GPU=1` for experiments.
+    let force_gpu = std::env::var("SIGHURT_TRAIN_GPU")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
-    let gpu = if force_cpu {
-        Gpu::new_cpu()
-    } else {
+    let gpu = if force_gpu {
         match Gpu::new() {
             Ok(g) => g,
             Err(e) => {
@@ -80,7 +98,13 @@ fn main() -> Result<()> {
                 Gpu::new_cpu()
             }
         }
+    } else {
+        Gpu::new_cpu()
     };
+    // Legacy: SIGHURT_TRAIN_CPU=1 used to mean "force CPU when GPU is
+    // default". CPU is now the default, so the variable is moot. We
+    // intentionally do not warn — the new default does what the old
+    // override did.
     println!("Auto-trainer starting. Backend: {}", gpu.device_name());
 
     let dialog = Data::load()?;
@@ -139,7 +163,13 @@ fn main() -> Result<()> {
     }
     let val_n = ((total as f32) * args.val_frac).round() as usize;
     let val_n = val_n.max(1).min(total.saturating_sub(1));
-    let val_examples: Vec<_> = examples.split_off(total - val_n);
+    let mut val_examples: Vec<_> = examples.split_off(total - val_n);
+    if let Some(cap) = args.max_train_examples {
+        examples.truncate(cap);
+    }
+    if let Some(cap) = args.max_val_examples {
+        val_examples.truncate(cap);
+    }
     println!(
         "Extracted {} examples total -> {} train / {} val.",
         total,

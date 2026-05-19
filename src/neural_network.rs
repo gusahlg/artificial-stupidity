@@ -3,7 +3,6 @@ use crate::embeddings::Embedding;
 use crate::gpu::{Backend, Gpu, LayerGpu};
 use crate::machine_learning::teacher_response;
 use crate::persons::{BOT_PERSON_ID, close_tag, open_tag};
-use crate::teacher::compute_deltas;
 use crate::tokenizer::{PAD, UNK, tokenize};
 use anyhow::Result;
 use rand::Rng;
@@ -161,6 +160,47 @@ impl Layer {
         })
     }
 
+    /// Reconstruct from persisted weights, biases AND Adam moments. Used by
+    /// `persist::load` on v3 model files so the resumed run keeps its Adam
+    /// momentum / second-moment state instead of zeroing it and paying the
+    /// first-step warmup tax on every restart.
+    pub fn from_parts_with_adam(
+        rows: usize,
+        cols: usize,
+        activation: Activation,
+        weights: Vec<f32>,
+        biases: Vec<f32>,
+        w_m: Vec<f32>,
+        w_v: Vec<f32>,
+        b_m: Vec<f32>,
+        b_v: Vec<f32>,
+        gpu: &Gpu,
+    ) -> Result<Self> {
+        debug_assert_eq!(weights.len(), rows * cols);
+        debug_assert_eq!(biases.len(), rows);
+        debug_assert_eq!(w_m.len(), rows * cols);
+        debug_assert_eq!(w_v.len(), rows * cols);
+        debug_assert_eq!(b_m.len(), rows);
+        debug_assert_eq!(b_v.len(), rows);
+        let layer_gpu = Self::alloc_gpu(rows, cols, &weights, gpu)?;
+        Ok(Self {
+            w_m,
+            w_v,
+            b_m,
+            b_v,
+            weights,
+            biases,
+            rows,
+            cols,
+            activation,
+            last_input: Vec::new(),
+            last_activations: Vec::new(),
+            layer_gpu,
+            matmul_out: vec![0.0; rows],
+            gpu_dirty: false,
+        })
+    }
+
     fn alloc_gpu(
         rows: usize,
         cols: usize,
@@ -243,14 +283,39 @@ pub struct Network {
     pub hidden_layers: usize,
     pub embed_dim: usize,
     pub context_window: usize,
-    /// Adam time-step counter. Not persisted — bias correction is stable
-    /// after a handful of steps anyway, so a fresh counter on resume is fine.
+    /// Adam time-step counter. Persisted in v3 model files so a resumed
+    /// run keeps its bias-correction warm and skips the first-step tax.
     pub adam_step: u64,
     /// Reusable backward-pass buffers. Held on the network so we don't
     /// allocate per training step. `train_step` `mem::take`s this out so
     /// it can pass `&Network` + `&mut scratch` separately past the borrow
     /// checker, then puts it back when done.
     pub backprop_scratch: crate::teacher::BackpropScratch,
+    /// Accumulated per-phase wall time across training steps. Filled by
+    /// `train_step` (backward / dense Adam / embedding Adam) and by
+    /// `train_one_epoch` (forward). `Instant::now()` is ~tens of ns on
+    /// Linux so the always-on cost over ~100k steps/epoch is well under
+    /// 10 ms. Read + reset by `train_one_epoch` once per epoch; printed
+    /// when `SIGHURT_TIME_STEPS=1`.
+    pub profile: StepProfile,
+}
+
+/// Per-phase wall-time accumulator for one training epoch's worth of
+/// `train_step` calls. Nanoseconds because `Duration::as_nanos` returns
+/// u128 and a 4-hour epoch fits comfortably.
+#[derive(Default, Clone, Copy, Debug)]
+pub struct StepProfile {
+    pub forward_ns: u128,
+    pub backward_ns: u128,
+    pub adam_dense_ns: u128,
+    pub adam_embed_ns: u128,
+    pub steps: u64,
+}
+
+impl StepProfile {
+    pub fn reset(&mut self) {
+        *self = Self::default();
+    }
 }
 
 fn softmax_inplace(x: &mut [f32]) {
@@ -335,7 +400,10 @@ impl Network {
         // `&mut BackpropScratch` (for writes) as disjoint borrows. Returned
         // at end of function.
         let mut scratch = std::mem::take(&mut self.backprop_scratch);
+        let t_back = std::time::Instant::now();
         crate::teacher::compute_deltas_into(self, target_idx, &mut scratch);
+        self.profile.backward_ns += t_back.elapsed().as_nanos();
+        let t_adam_dense = std::time::Instant::now();
         let bp = &scratch;
         for (idx, layer) in self.layers.iter_mut().enumerate() {
             let d = &bp.layer_deltas[idx];
@@ -423,7 +491,9 @@ impl Network {
                 });
             layer.gpu_dirty = true;
         }
+        self.profile.adam_dense_ns += t_adam_dense.elapsed().as_nanos();
 
+        let t_adam_embed = std::time::Instant::now();
         let embed_grad_len = self.context_window * self.embed_dim;
         self.embedding.apply_grad_adam(
             &bp.input_grad[..embed_grad_len],
@@ -434,6 +504,8 @@ impl Network {
             WEIGHT_DECAY,
             self.adam_step,
         );
+        self.profile.adam_embed_ns += t_adam_embed.elapsed().as_nanos();
+        self.profile.steps += 1;
 
         // Return scratch buffers to the network for the next call to reuse.
         self.backprop_scratch = scratch;
@@ -558,6 +630,7 @@ pub fn network_init(
         context_window,
         adam_step: 0,
         backprop_scratch: crate::teacher::BackpropScratch::default(),
+        profile: StepProfile::default(),
     })
 }
 
@@ -806,6 +879,10 @@ pub fn train_one_epoch(
     let mut rng = rand::thread_rng();
     train_examples.shuffle(&mut rng);
 
+    // Per-epoch phase timing is reset here. `train_step` adds to the
+    // backward / Adam buckets, this loop adds to the forward bucket.
+    net.profile.reset();
+
     let mut train_loss = 0.0f64;
     let mut train_targets = 0u64;
     for ex in train_examples.iter() {
@@ -826,7 +903,9 @@ pub fn train_one_epoch(
 
         for (i, target_word) in targets.iter().enumerate() {
             let window = build_token_window(&context, &vocab, CONTEXT_WINDOW);
+            let t_fwd = std::time::Instant::now();
             let probs = net.forward_and_cache(gpu, &window, i)?;
+            net.profile.forward_ns += t_fwd.elapsed().as_nanos();
             if let Some(target_id) = vocab.lookup(target_word) {
                 let p = probs[target_id].max(1e-9);
                 train_loss += -(p as f64).ln();
@@ -838,6 +917,34 @@ pub fn train_one_epoch(
             }
             context.push(target_word.clone());
         }
+    }
+
+    if std::env::var("SIGHURT_TIME_STEPS")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+    {
+        let p = &net.profile;
+        let total = (p.forward_ns + p.backward_ns + p.adam_dense_ns + p.adam_embed_ns) as f64;
+        let steps = p.steps.max(1) as f64;
+        let pct = |x: u128| -> f64 {
+            if total > 0.0 {
+                100.0 * (x as f64) / total
+            } else {
+                0.0
+            }
+        };
+        eprintln!(
+            "  timing> steps={} fwd={:.1}%/{:.0}µs back={:.1}%/{:.0}µs adam_dense={:.1}%/{:.0}µs adam_embed={:.1}%/{:.0}µs",
+            p.steps,
+            pct(p.forward_ns),
+            (p.forward_ns as f64) / steps / 1_000.0,
+            pct(p.backward_ns),
+            (p.backward_ns as f64) / steps / 1_000.0,
+            pct(p.adam_dense_ns),
+            (p.adam_dense_ns as f64) / steps / 1_000.0,
+            pct(p.adam_embed_ns),
+            (p.adam_embed_ns as f64) / steps / 1_000.0,
+        );
     }
 
     let mut val_loss = 0.0f64;

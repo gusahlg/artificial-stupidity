@@ -1,0 +1,5 @@
+Auto-trainer starting. Backend: NVIDIA GeForce RTX 3070
+Vocab size: 3029 (max PERSON id: 12)
+Loaded existing model from model.bin; continuing training.
+Extracted 11806 examples total -> 10625 train / 1181 val.
+epoch   1/100000  lr=0.00100  train=9.2625  val=10.3139  (116742t/13715v)  dt=3513.72s  total=3513.7s

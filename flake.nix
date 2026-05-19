@@ -1,5 +1,5 @@
 {
-  description = "rust_fun: SuperSighurt LLM-mode demo on top of ml_project's Vulkan GEMM";
+  description = "artificial-stupidity: tiny from-scratch language model on top of ml_project's Vulkan GEMM";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -26,7 +26,7 @@
 
             shellHook = ''
               export LD_LIBRARY_PATH="${pkgs.vulkan-loader}/lib:/run/opengl-driver/lib:''${LD_LIBRARY_PATH:-}"
-              echo "rust_fun dev shell: Vulkan loader on LD_LIBRARY_PATH."
+              echo "artificial-stupidity dev shell: Vulkan loader on LD_LIBRARY_PATH."
               echo "Run: cargo run --release"
             '';
           };

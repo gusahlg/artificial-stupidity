@@ -50,6 +50,29 @@ impl Embedding {
         }
     }
 
+    /// Reconstruct from persisted weights AND Adam moments. Used by `persist::load`
+    /// on v3 model files so a resumed training run keeps its momentum/variance
+    /// estimates and skips the Adam warmup penalty.
+    pub fn from_parts_with_adam(
+        vocab_size: usize,
+        embed_dim: usize,
+        weights: Vec<f32>,
+        m: Vec<f32>,
+        v: Vec<f32>,
+    ) -> Self {
+        debug_assert_eq!(weights.len(), vocab_size * embed_dim);
+        debug_assert_eq!(m.len(), weights.len());
+        debug_assert_eq!(v.len(), weights.len());
+        Self {
+            m,
+            v,
+            weights,
+            vocab_size,
+            embed_dim,
+            last_token_ids: Vec::new(),
+        }
+    }
+
     pub fn lookup(&self, id: usize) -> &[f32] {
         let start = id * self.embed_dim;
         &self.weights[start..start + self.embed_dim]
