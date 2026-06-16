@@ -106,7 +106,11 @@ fn main() -> Result<()> {
         let mut emitted_sections_for_channel: u64 = 0;
         for section in sections.iter() {
             let turns = build_section_turns(section);
-            if turns.is_empty() {
+            // Sections with <2 turns have no dialog signal:
+            // `extract_train_examples` in src/neural_network.rs skips them
+            // anyway. Filtering at ingest time keeps the file smaller
+            // and prevents them from biasing the val-tail split.
+            if turns.len() < 2 {
                 continue;
             }
             writeln!(out, "<SEC>")?;
@@ -466,14 +470,39 @@ struct CacheFile {
 }
 
 fn sanitize_for_corpus(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for ch in s.chars() {
-        match ch {
-            '\n' | '\r' | '\t' => out.push(' '),
-            // Replace angle brackets so user content can't impersonate a PERSON tag.
-            '<' => out.push('('),
-            '>' => out.push(')'),
-            c => out.push(c),
+    // Step 1: replace control chars + angle brackets so user content
+    // can't impersonate a PERSON tag or break newline framing.
+    let prepped: String = s
+        .chars()
+        .map(|c| match c {
+            '\n' | '\r' | '\t' => ' ',
+            '<' => '(',
+            '>' => ')',
+            c => c,
+        })
+        .collect();
+    // Step 2: collapse URL-looking and emoji-shortcode whitespace-
+    // tokens to single placeholders (`__URL__`, `__EMOJI__`). Our
+    // punctuation-splitting tokenizer otherwise fragments a single
+    // Tenor/Discord link into ~20 single-char tokens that consume
+    // most of the 32-token context window with unpredictable noise,
+    // and shatters a `:name:` shortcode into `:`, `name`, `:`. The
+    // placeholders are alphanumeric+underscore tokens recognized
+    // symmetrically by `clean_corpus` rules 4/9/11 via the shared
+    // `looks_like_url` / `is_emoji_shortcode` helpers.
+    let mut out = String::with_capacity(prepped.len());
+    let mut first = true;
+    for word in prepped.split_whitespace() {
+        if !first {
+            out.push(' ');
+        }
+        first = false;
+        if rust_fun::text_utils::looks_like_url(word) {
+            out.push_str("__URL__");
+        } else if rust_fun::text_utils::is_emoji_shortcode(word) {
+            out.push_str("__EMOJI__");
+        } else {
+            out.push_str(word);
         }
     }
     out

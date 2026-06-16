@@ -414,20 +414,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8ca58f447f06ed17d5fc4043ce1b10dd205e060fb3ce5b979b8ed8e59ff3f79"
 
 [[package]]
-name = "ml_project"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "ash",
- "bytemuck",
- "env_logger",
- "log",
- "parking_lot",
- "rayon",
- "thiserror",
-]
-
-[[package]]
 name = "once_cell"
 version = "1.21.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -613,11 +599,11 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "bincode",
- "ml_project",
  "rand",
  "rayon",
  "serde",
  "serde_json",
+ "tensor-ash",
  "tiny_http",
  "ureq",
  "wide",
@@ -713,6 +699,21 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
+]
+
+[[package]]
+name = "tensor-ash"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "ash",
+ "bytemuck",
+ "env_logger",
+ "log",
+ "parking_lot",
+ "rayon",
+ "scopeguard",
+ "thiserror",
 ]
 
 [[package]]

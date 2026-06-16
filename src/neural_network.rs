@@ -52,7 +52,50 @@ pub const HIDDEN_SIZE: usize = 768;
 pub const NUMBER_OF_HIDDEN_LAYERS: usize = 4;
 pub const CONTEXT_WINDOW: usize = 32;
 pub const POSITION_FEATURES: usize = 1;
+/// Inference-side repetition penalty. Each time `generate` samples a
+/// token, the next forward pass's softmax probabilities for that
+/// token (and the few before it, up to `REPETITION_WINDOW`) are
+/// multiplied by this factor before `sample_top_k`. Values < 1.0
+/// downweight already-emitted tokens; 1.0 disables the penalty.
+/// 0.5 was found empirically to fix the "the. the- 1." mid-reply
+/// repetition pattern observed in 2026-05-22 manual testing without
+/// suppressing legitimately repeating function words ("a", "the",
+/// "i", etc.) too aggressively, because the penalty only sees the
+/// most recent few emissions.
+pub const REPETITION_PENALTY: f32 = 0.5;
+/// How many of the most recent generated tokens get the repetition
+/// penalty applied. Keep small (~6) so common words like "the" /
+/// "a" / "i" can still appear at a natural frequency.
+pub const REPETITION_WINDOW: usize = 6;
+/// Per-element gradient clamp. Kept as a final safety bound after the
+/// global-norm scale below, so a single pathological weight can never
+/// move by more than this. Most updates are well under this magnitude
+/// once the global-norm rescale has fired.
 pub const GRAD_CLIP: f32 = 5.0;
+/// Global L2 gradient-norm clip threshold. Set to +infinity to make
+/// the clip a no-op while still letting the diagnostic measurement
+/// run.
+///
+/// **Why disabled.** The original idea was "clip-by-global-norm
+/// preserves direction better than element-wise clamp," but the
+/// implementation here clips the *delta* (post-activation gradient)
+/// vectors, not the actual *weight* gradients. The relationship is
+/// `dL/dW = delta_out ⊗ input_in`, so scaling delta also scales the
+/// weight gradient — but the scale factor that would be ideal
+/// differs per layer (it depends on `‖input_in‖`, which varies
+/// across the 4 layers). A single global scale on deltas does not
+/// match textbook "clip-by-global-norm" semantics.
+///
+/// Empirically: at fresh init `‖delta‖₂ ≈ 11`, but after a few
+/// thousand training steps it grows to the **thousands**. A
+/// "reasonable" textbook value (1.0, or even 50.0) fires on >80%
+/// of steps and erases the gradient signal, regressing val loss.
+/// The element-wise `GRAD_CLIP` clamp inside the Adam loop is
+/// preserved as the outlier guard.
+///
+/// The diagnostic statistics (mean / clip-count) are still emitted
+/// under `SIGHURT_TIME_STEPS=1` for future tuning experiments.
+pub const GLOBAL_GRAD_NORM_CLIP: f32 = f32::INFINITY;
 pub const MAX_GENERATION_LEN: usize = 40;
 pub const TOP_K_SAMPLE: usize = 5;
 /// Cap each training example's target sequence at this many tokens. Merged
@@ -94,6 +137,13 @@ pub struct Layer {
     pub activation: Activation,
     pub last_input: Vec<f32>,
     pub last_activations: Vec<f32>,
+    /// Per-neuron dropout scale factor for the most recent
+    /// training-time forward pass. Length matches `rows`. Values are
+    /// either `0.0` (neuron was dropped) or `1.0/(1-p)` (kept, scaled
+    /// to preserve activation expectation). Length 0 means "no
+    /// dropout was applied to this forward" — backward then leaves
+    /// gradients alone. Runtime-only; never serialized.
+    pub last_dropout_mask: Vec<f32>,
 
     layer_gpu: Option<LayerGpu>,
     matmul_out: Vec<f32>,
@@ -127,6 +177,7 @@ impl Layer {
             activation,
             last_input: Vec::new(),
             last_activations: Vec::new(),
+            last_dropout_mask: Vec::new(),
             layer_gpu,
             matmul_out: vec![0.0; rows],
             gpu_dirty: false,
@@ -154,6 +205,7 @@ impl Layer {
             activation,
             last_input: Vec::new(),
             last_activations: Vec::new(),
+            last_dropout_mask: Vec::new(),
             layer_gpu,
             matmul_out: vec![0.0; rows],
             gpu_dirty: false,
@@ -195,6 +247,7 @@ impl Layer {
             activation,
             last_input: Vec::new(),
             last_activations: Vec::new(),
+            last_dropout_mask: Vec::new(),
             layer_gpu,
             matmul_out: vec![0.0; rows],
             gpu_dirty: false,
@@ -286,6 +339,18 @@ pub struct Network {
     /// Adam time-step counter. Persisted in v3 model files so a resumed
     /// run keeps its bias-correction warm and skips the first-step tax.
     pub adam_step: u64,
+    /// Inverted-dropout probability applied to hidden-layer
+    /// activations during `forward_and_cache` (the training-time
+    /// forward). 0.0 disables (legacy behavior). `forward` (val /
+    /// generation) ignores this and runs full-strength. Runtime-only;
+    /// never serialized — the user sets it via `--dropout` on every
+    /// run.
+    pub dropout_p: f32,
+    /// Label smoothing factor α applied to the cross-entropy target
+    /// distribution in `compute_deltas_into`. Replaces the one-hot
+    /// target with `(1 - α) · one_hot + α · uniform`. 0.0 disables.
+    /// Runtime-only; set via `--label-smoothing F`.
+    pub label_smoothing: f32,
     /// Reusable backward-pass buffers. Held on the network so we don't
     /// allocate per training step. `train_step` `mem::take`s this out so
     /// it can pass `&Network` + `&mut scratch` separately past the borrow
@@ -310,6 +375,17 @@ pub struct StepProfile {
     pub adam_dense_ns: u128,
     pub adam_embed_ns: u128,
     pub steps: u64,
+    /// Sum of per-step pre-clip ‖grad‖₂ values (across the whole
+    /// network) over the epoch. Divide by `grad_norm_observations`
+    /// for the mean. Useful for tuning `GLOBAL_GRAD_NORM_CLIP`.
+    pub grad_norm_sum: f64,
+    /// Number of training steps whose pre-clip ‖grad‖ exceeded the
+    /// global threshold and were rescaled. If this is 100% the clip
+    /// is too tight; if 0% it's purely a safety guard.
+    pub grad_norm_clips: u64,
+    /// Number of training steps observed for the grad-norm stats.
+    /// Lags `steps` by exactly 0 — every `train_step` adds one.
+    pub grad_norm_observations: u64,
 }
 
 impl StepProfile {
@@ -376,11 +452,51 @@ impl Network {
         let embed = self.embedding.forward(token_ids, true);
         let mut input = make_input(embed, position);
         let n = self.layers.len();
+        // Sample a fresh inverted-dropout mask per forward and apply
+        // it to each *hidden* layer's activations. Output layer (the
+        // softmax over vocab) is never dropped — that would silence
+        // the very targets we're trying to predict.
+        //
+        // Subtlety: `Layer::forward(.., cache=true)` caches the
+        // *pre-dropout* tanh output in `last_activations`. Backward
+        // (`compute_deltas_into`) reads that to compute the tanh
+        // derivative `1 - a²`. The dropout *mask* is a separate
+        // multiplicative factor on the gradient flowing through that
+        // neuron — applied independently in backward. We must NOT
+        // overwrite `last_activations` with the post-dropout values,
+        // because `1 - (scale*tanh(z))²` ≠ `1 - tanh(z)²` and the
+        // former collapses to zero whenever `scale*tanh(z) → ±1`,
+        // crippling training (observed: 90-min run regressed val
+        // 5.80 → 7.10 across 2 epochs at p=0.1). Forward propagation
+        // does see the post-dropout values via the `input` variable
+        // (which is what gets passed to the next layer).
+        let p = self.dropout_p;
+        let keep = 1.0 - p;
+        let scale = if keep > 0.0 { 1.0 / keep } else { 0.0 };
+        let mut rng = rand::thread_rng();
         for (i, layer) in self.layers.iter_mut().enumerate() {
             input = layer.forward(gpu, &input, true)?;
             if i == n - 1 {
+                // Final layer: softmax, no dropout. Re-cache because
+                // backward reads `last_activations` for the output
+                // delta `softmax - one_hot`.
                 softmax_inplace(&mut input);
                 layer.last_activations.clone_from(&input);
+                layer.last_dropout_mask.clear();
+            } else if p > 0.0 {
+                // Hidden layer with dropout enabled. Sample a fresh
+                // mask, scale `input` (which propagates forward) but
+                // LEAVE `last_activations` at its pre-dropout value.
+                layer.last_dropout_mask.clear();
+                layer.last_dropout_mask.reserve(input.len());
+                for v in input.iter_mut() {
+                    let r: f32 = rng.gen_range(0.0..1.0);
+                    let m = if r < keep { scale } else { 0.0 };
+                    layer.last_dropout_mask.push(m);
+                    *v *= m;
+                }
+            } else {
+                layer.last_dropout_mask.clear();
             }
         }
         Ok(input)
@@ -402,6 +518,40 @@ impl Network {
         let mut scratch = std::mem::take(&mut self.backprop_scratch);
         let t_back = std::time::Instant::now();
         crate::teacher::compute_deltas_into(self, target_idx, &mut scratch);
+        // Global-norm clip across all gradients (every layer's delta
+        // vector + the embedding input_grad). Computed via SUM-of-
+        // squares then a single sqrt so it's one pass even with many
+        // layers. Preserves gradient direction, unlike the per-element
+        // clamp inside the inner Adam loop.
+        {
+            let mut sq: f64 = 0.0;
+            for d in &scratch.layer_deltas {
+                for &g in d.iter() {
+                    sq += (g as f64) * (g as f64);
+                }
+            }
+            for &g in scratch.input_grad.iter() {
+                sq += (g as f64) * (g as f64);
+            }
+            let norm = sq.sqrt() as f32;
+            let clipped = norm > GLOBAL_GRAD_NORM_CLIP && norm.is_finite();
+            if clipped {
+                let scale = GLOBAL_GRAD_NORM_CLIP / norm;
+                for d in scratch.layer_deltas.iter_mut() {
+                    for g in d.iter_mut() {
+                        *g *= scale;
+                    }
+                }
+                for g in scratch.input_grad.iter_mut() {
+                    *g *= scale;
+                }
+            }
+            self.profile.grad_norm_sum += norm as f64;
+            if clipped {
+                self.profile.grad_norm_clips += 1;
+            }
+            self.profile.grad_norm_observations += 1;
+        }
         self.profile.backward_ns += t_back.elapsed().as_nanos();
         let t_adam_dense = std::time::Instant::now();
         let bp = &scratch;
@@ -538,7 +688,24 @@ impl<'a> VocabIndex<'a> {
         let mut forbidden_emit_ids: Vec<usize> = Vec::new();
         for (i, w) in words.iter().enumerate() {
             let w_str = w.as_str();
+            // Structural specials: PAD, UNK, SEC — never natural-language output.
             if w_str == PAD || w_str == UNK || w_str == crate::tokenizer::SEC {
+                forbidden_emit_ids.push(i);
+                continue;
+            }
+            // Training-only placeholders: corpus cleaner rules 9/10/11
+            // replace URLs / Discord mentions / emoji-shortcodes with
+            // these sentinel tokens so the punctuation-splitting
+            // tokenizer doesn't shatter them into per-character noise.
+            // The bot training-time WANTS these in the input/target
+            // streams as compact stand-ins, but emitting them in a
+            // generated reply is meaningless to a human reader — the
+            // user has already reported seeing "__MENTION__" appear
+            // mid-sentence. Mask out at generation time.
+            if w_str == crate::tokenizer::URL_PLACEHOLDER
+                || w_str == crate::tokenizer::MENTION_PLACEHOLDER
+                || w_str == crate::tokenizer::EMOJI_PLACEHOLDER
+            {
                 forbidden_emit_ids.push(i);
                 continue;
             }
@@ -629,6 +796,8 @@ pub fn network_init(
         embed_dim,
         context_window,
         adam_step: 0,
+        dropout_p: 0.0,
+        label_smoothing: 0.0,
         backprop_scratch: crate::teacher::BackpropScratch::default(),
         profile: StepProfile::default(),
     })
@@ -711,10 +880,12 @@ pub fn generate(
     context.push(bot_open);
 
     let mut produced: Vec<String> = Vec::new();
+    let mut recent_ids: Vec<usize> = Vec::with_capacity(REPETITION_WINDOW);
     for i in 0..MAX_GENERATION_LEN {
         let window = build_token_window(&context, &vocab, CONTEXT_WINDOW);
         let mut probs = net.forward(gpu, &window, i)?;
         mask_forbidden(&mut probs, &vocab.forbidden_emit_ids);
+        apply_repetition_penalty(&mut probs, &recent_ids, REPETITION_PENALTY);
         let idx = sample_top_k(&probs, TOP_K_SAMPLE);
         if idx >= words.len() {
             break;
@@ -723,10 +894,31 @@ pub fn generate(
         if next == &bot_close {
             break;
         }
+        // Slide the repetition window.
+        if recent_ids.len() >= REPETITION_WINDOW {
+            recent_ids.remove(0);
+        }
+        recent_ids.push(idx);
         context.push(next.clone());
         produced.push(next.clone());
     }
     Ok(detokenize(&produced))
+}
+
+/// Multiply `probs[id]` by `penalty` for every `id` in `recent_ids`.
+/// `penalty < 1.0` downweights recently-emitted tokens, reducing the
+/// chance the model emits the same token several times in a row.
+/// IDs out of `probs` range are silently ignored (defensive — should
+/// never happen if `recent_ids` is built from `sample_top_k` output).
+fn apply_repetition_penalty(probs: &mut [f32], recent_ids: &[usize], penalty: f32) {
+    if penalty >= 1.0 {
+        return;
+    }
+    for &id in recent_ids {
+        if id < probs.len() {
+            probs[id] *= penalty;
+        }
+    }
 }
 
 pub fn generate_and_train(
@@ -945,6 +1137,14 @@ pub fn train_one_epoch(
             pct(p.adam_embed_ns),
             (p.adam_embed_ns as f64) / steps / 1_000.0,
         );
+        if p.grad_norm_observations > 0 {
+            let mean = p.grad_norm_sum / p.grad_norm_observations as f64;
+            let clip_pct = 100.0 * (p.grad_norm_clips as f64) / (p.grad_norm_observations as f64);
+            eprintln!(
+                "  grad>  mean ‖g‖₂={:.4} clipped={}/{} ({:.1}%)",
+                mean, p.grad_norm_clips, p.grad_norm_observations, clip_pct,
+            );
+        }
     }
 
     let mut val_loss = 0.0f64;
@@ -1053,6 +1253,36 @@ mod tests {
     }
 
     #[test]
+    fn placeholder_tokens_are_forbidden_at_generation() {
+        // Regression: a real user reported the bot emitting literal
+        // `__MENTION__` / `__URL__` mid-sentence. Those are training-
+        // only sentinels added by clean_corpus and should never
+        // appear in a generated reply.
+        let words: Vec<String> = vec![
+            "<PAD>".into(),
+            "<UNK>".into(),
+            "<SEC>".into(),
+            "<PERSON_0>".into(),
+            "</PERSON_0>".into(),
+            "<PERSON_1>".into(),
+            "</PERSON_1>".into(),
+            "__URL__".into(),
+            "__MENTION__".into(),
+            "__EMOJI__".into(),
+            "hello".into(),
+        ];
+        let vi = VocabIndex::new(&words);
+        let forbidden: std::collections::HashSet<usize> =
+            vi.forbidden_emit_ids.iter().copied().collect();
+        // Placeholders forbidden.
+        assert!(forbidden.contains(&7), "__URL__ should be forbidden");
+        assert!(forbidden.contains(&8), "__MENTION__ should be forbidden");
+        assert!(forbidden.contains(&9), "__EMOJI__ should be forbidden");
+        // Normal content still allowed.
+        assert!(!forbidden.contains(&10), "regular tokens still allowed");
+    }
+
+    #[test]
     fn mask_forbidden_zeros_out_specified_positions() {
         let mut probs = vec![0.5, 0.3, 0.1, 0.1];
         mask_forbidden(&mut probs, &[1, 3]);
@@ -1064,5 +1294,26 @@ mod tests {
         let mut probs = vec![0.5, 0.5];
         mask_forbidden(&mut probs, &[0, 5, 7]);
         assert_eq!(probs, vec![0.0, 0.5]);
+    }
+
+    #[test]
+    fn repetition_penalty_downweights_recent_ids() {
+        let mut probs = vec![1.0, 1.0, 1.0, 1.0];
+        apply_repetition_penalty(&mut probs, &[1, 3], 0.5);
+        assert_eq!(probs, vec![1.0, 0.5, 1.0, 0.5]);
+    }
+
+    #[test]
+    fn repetition_penalty_is_noop_at_unity() {
+        let mut probs = vec![0.4, 0.6];
+        apply_repetition_penalty(&mut probs, &[0, 1], 1.0);
+        assert_eq!(probs, vec![0.4, 0.6]);
+    }
+
+    #[test]
+    fn repetition_penalty_tolerates_out_of_range_ids() {
+        let mut probs = vec![1.0, 1.0];
+        apply_repetition_penalty(&mut probs, &[0, 5, 9], 0.5);
+        assert_eq!(probs, vec![0.5, 1.0]);
     }
 }

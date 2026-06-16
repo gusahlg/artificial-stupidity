@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use anyhow::Result;
-use ml_project::{Executor, MatmulCall, MatmulPipeline, Tensor, VulkanContext};
+use tensor_ash::{Executor, MatmulCall, MatmulPipeline, Tensor, VulkanContext};
 
 /// Compute backend. Vulkan when available; CPU as a portable fallback so the
 /// project (and the auto-trainer) works on machines without a working Vulkan
@@ -73,9 +73,9 @@ pub struct LayerGpu {
 
 impl LayerGpu {
     pub fn new(v: &VulkanBackend, rows: usize, cols: usize) -> Result<Self> {
-        let gpu_weights = Tensor::zeros_device(&v.ctx, &[rows as u32, cols as u32])?;
-        let gpu_input = Tensor::zeros_device(&v.ctx, &[cols as u32, 1])?;
-        let gpu_output = Tensor::zeros_device(&v.ctx, &[rows as u32, 1])?;
+        let gpu_weights = Tensor::uninit_device(&v.ctx, &[rows as u32, cols as u32])?;
+        let gpu_input = Tensor::uninit_device(&v.ctx, &[cols as u32, 1])?;
+        let gpu_output = Tensor::uninit_device(&v.ctx, &[rows as u32, 1])?;
         Ok(Self {
             gpu_weights,
             gpu_input,

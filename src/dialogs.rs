@@ -24,8 +24,18 @@ use std::path::Path;
 pub const DIALOGS_FILE: &str = "data/dialogs.txt";
 pub const DIALOGS_CACHE_FILE: &str = "data/dialogs.bin";
 
-/// File-format version for `dialogs.bin`. Bump if `Turn` shape changes.
-const CACHE_VERSION: u32 = 1;
+/// File-format version for `dialogs.bin`. Bump if `Turn` shape changes
+/// OR if the tokenizer's output for the same input text changes (the
+/// cache stores already-tokenized turns, so a tokenizer change makes
+/// the cache content invalid even though the raw `dialogs.txt` is
+/// byte-identical).
+///
+/// History:
+///   1 — initial bincode format.
+///   2 — `__URL__` added to `tokenizer::is_special_passthrough`
+///       (previously fragmented to `_ _ url _ _`).
+///   3 — `__MENTION__` and `__EMOJI__` added to passthrough.
+const CACHE_VERSION: u32 = 3;
 
 /// Default cap on the number of content tokens (excluding PAD/UNK/SEC and
 /// PERSON tags) kept in the vocab. Tokens not in the top-K by corpus

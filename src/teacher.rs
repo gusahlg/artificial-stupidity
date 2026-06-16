@@ -67,11 +67,30 @@ pub fn compute_deltas_into(net: &Network, target_idx: usize, scratch: &mut Backp
     }
     let layer_deltas = &mut scratch.layer_deltas;
 
-    // Output layer: softmax - one_hot.
+    // Output layer: softmax minus the *target distribution*. Without
+    // label smoothing the target is a one-hot at `target_idx`. With
+    // smoothing α (`net.label_smoothing`), we replace the one-hot
+    // with `(1 - α) · one_hot + α · uniform(V)` — so the target index
+    // gets `1 - α + α/V` and every other index gets `α/V`. The delta
+    // (softmax − target_dist) is the gradient of cross-entropy with
+    // respect to the pre-softmax logits, identical structure to the
+    // one-hot case but with softer asymptotic targets. Empirically
+    // worth 0.05–0.15 val loss on LM training. α = 0.0 disables.
     let out_acts = &net.layers[n - 1].last_activations;
-    for i in 0..out_acts.len() {
-        let t = if i == target_idx { 1.0 } else { 0.0 };
-        layer_deltas[n - 1][i] = out_acts[i] - t;
+    let v = out_acts.len();
+    let alpha = net.label_smoothing;
+    if alpha <= 0.0 {
+        for i in 0..v {
+            let t = if i == target_idx { 1.0 } else { 0.0 };
+            layer_deltas[n - 1][i] = out_acts[i] - t;
+        }
+    } else {
+        let off = alpha / v as f32;
+        let on = 1.0 - alpha + off;
+        for i in 0..v {
+            let t = if i == target_idx { on } else { off };
+            layer_deltas[n - 1][i] = out_acts[i] - t;
+        }
     }
 
     // Hidden layers: walk row-major next_w in k-outer order, j-chunked.
@@ -80,6 +99,15 @@ pub fn compute_deltas_into(net: &Network, target_idx: usize, scratch: &mut Backp
         let next_cols = next_layer.cols;
         let acts = &net.layers[li].last_activations;
         let layer_activation = net.layers[li].activation;
+        // Empty mask = dropout was not applied to this layer's forward.
+        // Non-empty mask has one entry per neuron: 0.0 (dropped) or
+        // 1/(1-p) (kept, scaled). Multiplying the delta by it ensures
+        // dropped neurons receive zero gradient (matching the forward
+        // where their activation was zeroed) and kept neurons are
+        // scaled consistently with the forward's inverted-dropout
+        // expectation preservation.
+        let dropout_mask: &[f32] = &net.layers[li].last_dropout_mask;
+        let apply_mask = !dropout_mask.is_empty();
         let (left, right) = layer_deltas.split_at_mut(li + 1);
         let curr = &mut left[li];
         let next_d: &[f32] = &right[0];
@@ -105,7 +133,7 @@ pub fn compute_deltas_into(net: &Network, target_idx: usize, scratch: &mut Backp
                         *slot += row_slice[off] * d;
                     }
                 }
-                // Apply activation derivative per j.
+                // Apply activation derivative per j, then dropout mask.
                 for (off, slot) in slot_chunk.iter_mut().enumerate() {
                     let j = j_start + off;
                     let slope = match layer_activation {
@@ -113,6 +141,9 @@ pub fn compute_deltas_into(net: &Network, target_idx: usize, scratch: &mut Backp
                         Activation::Linear => 1.0,
                     };
                     *slot *= slope;
+                    if apply_mask {
+                        *slot *= dropout_mask[j];
+                    }
                 }
             },
         );

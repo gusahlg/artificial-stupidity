@@ -5,8 +5,8 @@ A tiny from-scratch neural language model written in Rust. Embedding table
 AdamW. Has an interactive REPL, a standalone trainer, and an HTTP server
 that exposes inference over the network (driven by a separate Discord
 bot, not in this repo). The math runs on the CPU by default; a Vulkan
-GEMM backend (via the sibling `ml_project` crate) is available as an
-opt-in for experiments.
+GEMM backend (via the sibling `tensor-ash` crate at `../ml_project`)
+is available as an opt-in for experiments.
 
 ## Layout
 
@@ -16,8 +16,10 @@ opt-in for experiments.
 - `src/bin/convert_discord.rs` — ingest a Discord export into the dialog format
 - `src/bin/ingest_dailydialog.rs` / `ingest_tinystories.rs` — corpus loaders
 - `src/bin/inject_seed.rs` — splice a fixed set of "seed" Q/A pairs into the corpus
+- `src/bin/clean_corpus.rs` — filter junk turns (URL-only, emoji-only, role-ping, repeats), drop monologue / single-speaker / sub-2-turn sections, then deterministically shuffle so the val-tail split is a random sample. Idempotent
 - `src/bin/rebuild_vocab.rs` — regenerate `vocab.txt` without retraining
 - `src/tokenizer.rs` — lowercase + punctuation-splitting tokenizer
+- `src/text_utils.rs` — small text helpers shared by `clean_corpus` and `convert_discord` (URL detection, kept in sync between writer and filter)
 - `src/embeddings/mod.rs` — trainable word embedding table (with Adam state)
 - `src/neural_network.rs` — model, forward, generation, training loop
 - `src/teacher.rs` — softmax + cross-entropy backprop (incl. input gradient for embeddings)
@@ -62,9 +64,12 @@ Commands inside the chat:
 | `:save` | checkpoint `model.bin` now |
 | `:train on` / `:train off` | toggle online learning during chat |
 
-Online learning is on by default: every turn pulls a "teacher response"
-from the dialog corpus and runs one SGD step against it, so the model
-keeps drifting while you chat.
+Online learning is **off by default**. When enabled (`:train on`), every
+turn pulls a "teacher response" from the dialog corpus and runs one
+SGD step against it at a deliberately small per-turn LR (`ONLINE_LR =
+0.0001`, well below the offline trainer's typical 0.0003). Keep it off
+unless you intend to deliberately nudge the model — a chat session is
+a noisy signal and the updates go straight into the live `model.bin`.
 
 ## Auto-train
 
@@ -152,9 +157,28 @@ also indexes the corpus into a RAG store at startup and prepends the
 top-K most embedding-similar past turns to the per-channel chat memory
 before generating each reply.
 
-The server only reads `model.bin` at startup, so a running trainer can
-write `model.bin` without disturbing it — restart the server when you
-want it to pick up new weights.
+The server only reads `model.bin` at startup. Two systemd user units
+keep the live model fresh:
+
+- `~/.config/systemd/user/sighurt-llm.path` — watches `model.bin`
+  for `IN_CLOSE_WRITE` events.
+- `~/.config/systemd/user/sighurt-llm-reload.service` — oneshot
+  that runs `systemctl --user restart sighurt-llm.service`.
+
+The path unit triggers the reloader on every save. (A direct
+`Unit=sighurt-llm.service` doesn't work because systemd treats that
+as "start if inactive" — a no-op for an already-running service —
+so the oneshot wrapper is necessary to get a *restart*.) End result:
+the Discord bot (and anyone hitting the HTTP endpoint) always sees
+the most recently trained weights without manual intervention,
+~3 seconds of downtime per swap. The Pi's bot retries on
+connection-refused.
+
+`persist::save` writes via a `.tmp` sibling + rename, so the watcher
+never observes a half-written file. If you don't want restarts during
+heavy training churn, `systemctl --user stop sighurt-llm.path` pauses
+the watcher (the service keeps serving the currently-loaded weights);
+`systemctl --user start sighurt-llm.path` resumes it.
 
 Env vars:
 
@@ -204,8 +228,9 @@ Binary, little-endian. Header: magic `0x4D4F_444C` ("MODL"), `u32`
 version. Two versions exist:
 
 - **v2** — weights + biases only. Adam moments are recreated as zeros
-  on load, so a resumed run pays a one-step bias-correction "warmup
-  tax" on every restart.
+  on load, so a resumed run pays a bias-correction "warmup tax" on the
+  first batch of steps, which in practice means epoch 1 after restart
+  is a small regression before things stabilize.
 - **v3** (current) — adds the AdamW moment buffers (`w_m`, `w_v`,
   `b_m`, `b_v` per layer, plus the embedding's `m`, `v`) and the global
   `adam_step` counter. A resumed run picks up Adam exactly where it
@@ -246,13 +271,43 @@ automatically. Any new tokens appended to the corpus get added to
 table and the output layer (the loader extends them in place rather
 than discarding the model).
 
+### Recommended workflow after editing the corpus
+
+1. Ingest / edit `data/dialogs.txt` (e.g. `convert_discord`, `inject_seed`,
+   or a hand edit).
+2. Run `cargo run --release --bin clean_corpus` to drop URL-only /
+   emoji-only / role-ping turns, drop monologue and single-speaker
+   sections, dedup over-repeated turns, and deterministically shuffle
+   sections so the val-tail split is not topical. The cleaner is
+   idempotent and writes via a `.tmp` sibling + rename (crash-safe).
+   Before the first run, back up the original corpus
+   (`cp data/dialogs.txt data/dialogs.txt.pre-clean`).
+3. Run `cargo run --release --bin rebuild_vocab` so `vocab.txt`
+   reflects the cleaned corpus.
+4. **Decide what to do with `model.bin`** — see the warning below. If
+   the vocab order changed (likely whenever long-tail frequencies
+   shift), move the old `model.bin` aside so the trainer fresh-inits.
+
+> **Vocab-reorder footgun**: `vocab.txt` is ordered by frequency. When
+> the corpus changes, common tokens stay near the head but the
+> long-tail order can shuffle, even if the line count stays the same.
+> `persist::load` only checks vocab SIZE — if the order moved, the
+> saved `model.bin` loads silently with the wrong row-to-word
+> mapping in the output layer (garbage outputs, NaN-free, no error).
+> Workaround: `mv model.bin model.bin.stale-vocab-order` after a
+> cleanup pass and let the trainer fresh-init. A proper fix would
+> hash the vocab into `model.bin` and bail on mismatch.
+
 ## Resetting the model
 
-Just delete it:
+Just delete (or rename away) `model.bin`:
 
 ```sh
-rm model.bin
+mv model.bin model.bin.bak
 ./target/release/train --epochs 50
 ```
 
-The next run starts from random weights and retrains.
+The next run starts from random weights and retrains. Renaming rather
+than deleting is the safer habit — if the model that just got
+discarded was the only copy of a good checkpoint, the `.bak` lets you
+roll back.

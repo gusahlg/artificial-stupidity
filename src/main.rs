@@ -12,7 +12,13 @@ use std::time::Instant;
 const MODEL_PATH: &str = "model.bin";
 const PRETRAIN_EPOCHS: usize = 3;
 const PRETRAIN_LR: f32 = 0.05;
-const ONLINE_LR: f32 = 0.02;
+/// Per-turn LR when interactive training is enabled. Deliberately very
+/// small: a chat turn is a batch of 1 against a teacher response of
+/// unverified quality, and any cumulative drift goes straight into
+/// the live `model.bin`. Keep it ≪ the offline-trainer LR (currently
+/// 0.0003) — a few hundred turns at 0.0001 should nudge the model,
+/// not rewrite it.
+const ONLINE_LR: f32 = 0.0001;
 const SAVE_EVERY_N_TURNS: usize = 5;
 
 fn main() -> anyhow::Result<()> {
@@ -29,15 +35,17 @@ fn main() -> anyhow::Result<()> {
     memory::save_vocab(&vocab);
     println!("Vocab size: {}", vocab.len());
 
+    let vocab_hash = persist::compute_vocab_hash(&vocab);
     let shape = LoadedShape {
         embed_dim: EMBED_DIM,
         context_window: CONTEXT_WINDOW,
         vocab_size: vocab.len(),
         hidden_size: HIDDEN_SIZE,
         hidden_layers: NUMBER_OF_HIDDEN_LAYERS,
+        vocab_hash,
     };
 
-    let mut net = match persist::load(MODEL_PATH, &gpu, shape) {
+    let mut net = match persist::load_with_vocab(MODEL_PATH, &gpu, shape, Some(&vocab)) {
         Ok(Some(n)) => {
             println!("Loaded saved model from {}", MODEL_PATH);
             n
@@ -62,7 +70,7 @@ fn main() -> anyhow::Result<()> {
                 "Pretraining done in {:.2}s. Saving initial weights.",
                 t0.elapsed().as_secs_f64()
             );
-            persist::save(&net, MODEL_PATH)?;
+            persist::save(&net, MODEL_PATH, vocab_hash)?;
             net
         }
         Err(e) => {
@@ -84,7 +92,7 @@ fn main() -> anyhow::Result<()> {
                 "Pretraining done in {:.2}s. Saving initial weights.",
                 t0.elapsed().as_secs_f64()
             );
-            persist::save(&net, MODEL_PATH)?;
+            persist::save(&net, MODEL_PATH, vocab_hash)?;
             net
         }
     };
@@ -93,8 +101,12 @@ fn main() -> anyhow::Result<()> {
     let mut output = String::new();
     let mut input = String::new();
 
-    println!("Type ':q' to quit, ':save' to checkpoint, ':train off|on' to toggle.");
-    let mut train_active = true;
+    // Online training defaults OFF. The previous default (on, at LR 0.02)
+    // could drift the model materially in a handful of turns, and a chat
+    // session is a noisy training signal compared to the supervised
+    // trainer. Opt in per session with `:train on`.
+    println!("Type ':q' to quit, ':save' to checkpoint, ':train on|off' to toggle online learning (off by default).");
+    let mut train_active = false;
 
     while talking {
         if !output.trim().is_empty() {
@@ -113,7 +125,7 @@ fn main() -> anyhow::Result<()> {
                 continue;
             }
             if input == ":save" {
-                persist::save(&net, MODEL_PATH)?;
+                persist::save(&net, MODEL_PATH, vocab_hash)?;
                 println!("[saved to {}]", MODEL_PATH);
                 continue;
             }
@@ -155,13 +167,13 @@ fn main() -> anyhow::Result<()> {
 
             turns_since_save += 1;
             if train_active && turns_since_save >= SAVE_EVERY_N_TURNS {
-                persist::save(&net, MODEL_PATH)?;
+                persist::save(&net, MODEL_PATH, vocab_hash)?;
                 turns_since_save = 0;
             }
         }
     }
 
-    persist::save(&net, MODEL_PATH)?;
+    persist::save(&net, MODEL_PATH, vocab_hash)?;
     println!("Model saved to {}.", MODEL_PATH);
     Ok(())
 }

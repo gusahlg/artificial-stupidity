@@ -9,4 +9,5 @@ pub mod persist;
 pub mod persons;
 pub mod rag;
 pub mod teacher;
+pub mod text_utils;
 pub mod tokenizer;

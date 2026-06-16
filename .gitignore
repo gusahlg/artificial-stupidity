@@ -1,8 +1,26 @@
 /target
+
+# Discord / embeddings data (local only)
 /data/discord/
 /data/embeddings.db
 /data/embeddings.db-journal
 /data/embeddings.db-wal
 /data/embeddings.db-shm
+
+# Tooling / staging
 /.pi-stage/
+/.serena/
+
+# Model weights & checkpoints — too large for git (GitHub rejects files >100MB)
+/model.bin
+/model.bin.*
+
+# Training run logs
 /training.log
+/training-*.log
+/training-*.log.*
+
+# Corpus & vocab snapshot backups (keep the live data/dialogs.* and vocab.txt only)
+/vocab.txt.pre-*
+/data/dialogs.txt.pre-*
+/data/dialogs.txt.session-P-corpus

@@ -1,9 +1,0 @@
-Auto-trainer starting. Backend: NVIDIA GeForce RTX 3070
-Vocab size: 3029 (max PERSON id: 12)
-Loaded existing model from model.bin; continuing training.
-Extracted 11806 examples total -> 10625 train / 1181 val.
-epoch   1/100000  lr=0.00050  train=7.3944  val=7.3041  (116742t/13715v)  dt=3509.69s  total=3509.7s
-epoch   2/100000  lr=0.00050  train=7.2748  val=6.9476  (116742t/13715v)  dt=3508.12s  total=7017.8s
-  sample> You: I'm building a chatbot in Rust.
-  sample> Bot: a one can
-epoch   3/100000  lr=0.00050  train=7.2065  val=8.1612  (116742t/13715v)  dt=3507.23s  total=10525.1s

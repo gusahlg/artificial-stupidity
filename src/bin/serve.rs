@@ -246,14 +246,16 @@ fn main() -> Result<()> {
     memory::save_vocab(&vocab);
     eprintln!("serve: vocab size = {}", vocab.len());
 
+    let vocab_hash = persist::compute_vocab_hash(&vocab);
     let shape = LoadedShape {
         embed_dim: EMBED_DIM,
         context_window: CONTEXT_WINDOW,
         vocab_size: vocab.len(),
         hidden_size: HIDDEN_SIZE,
         hidden_layers: NUMBER_OF_HIDDEN_LAYERS,
+        vocab_hash,
     };
-    let net = match persist::load(&model_path, &gpu, shape) {
+    let net = match persist::load_with_vocab(&model_path, &gpu, shape, Some(&vocab)) {
         Ok(Some(n)) => {
             eprintln!("serve: loaded model from {model_path}");
             n

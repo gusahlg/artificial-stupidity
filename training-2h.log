@@ -1,4 +1,0 @@
-Auto-trainer starting. Backend: cpu
-Vocab size: 3029 (max PERSON id: 12)
-Loaded existing model from model.bin; continuing training.
-Extracted 11806 examples total -> 10625 train / 1181 val.
