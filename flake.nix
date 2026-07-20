@@ -1,5 +1,5 @@
 {
-  description = "artificial-stupidity: tiny from-scratch language model on top of ml_project's Vulkan GEMM";
+  description = "artificial-stupidity: tiny from-scratch language model on top of tensor-ash's Vulkan GEMM";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";

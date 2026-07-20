@@ -5,7 +5,7 @@ A tiny from-scratch neural language model written in Rust. Embedding table
 AdamW. Has an interactive REPL, a standalone trainer, and an HTTP server
 that exposes inference over the network (driven by a separate Discord
 bot, not in this repo). The math runs on the CPU by default; a Vulkan
-GEMM backend (via the sibling `tensor-ash` crate at `../ml_project`)
+GEMM backend (via the sibling `tensor-ash` crate at `../tensor-ash`)
 is available as an opt-in for experiments.
 
 ## Layout
@@ -29,7 +29,7 @@ is available as an opt-in for experiments.
 - `src/rag.rs` — embedding-cosine retrieval store, used by `serve`
 - `src/dialogs.rs`, `src/memory.rs` — corpus + vocab loaders (with a bincode cache)
 - `data/dialogs.txt` — training corpus
-- `data/dialogs.bin` — bincode cache of the parsed corpus (auto-invalidated on edit)
+- `data/dialogs.bin` — ignored bincode cache of the parsed corpus (auto-invalidated on edit)
 - `vocab.txt` — derived vocabulary (regenerated from corpus on every run)
 - `model.bin` — saved embeddings + weights + biases + Adam state (created on first run)
 
@@ -140,7 +140,7 @@ Adam) so you can target the right bottleneck:
 
 ```sh
 SIGHURT_API_KEY=$(openssl rand -hex 32) \
-SIGHURT_BIND=0.0.0.0:8088 \
+SIGHURT_BIND=127.0.0.1:8088 \
 ./target/release/serve
 ```
 
@@ -157,28 +157,9 @@ also indexes the corpus into a RAG store at startup and prepends the
 top-K most embedding-similar past turns to the per-channel chat memory
 before generating each reply.
 
-The server only reads `model.bin` at startup. Two systemd user units
-keep the live model fresh:
-
-- `~/.config/systemd/user/sighurt-llm.path` — watches `model.bin`
-  for `IN_CLOSE_WRITE` events.
-- `~/.config/systemd/user/sighurt-llm-reload.service` — oneshot
-  that runs `systemctl --user restart sighurt-llm.service`.
-
-The path unit triggers the reloader on every save. (A direct
-`Unit=sighurt-llm.service` doesn't work because systemd treats that
-as "start if inactive" — a no-op for an already-running service —
-so the oneshot wrapper is necessary to get a *restart*.) End result:
-the Discord bot (and anyone hitting the HTTP endpoint) always sees
-the most recently trained weights without manual intervention,
-~3 seconds of downtime per swap. The Pi's bot retries on
-connection-refused.
-
-`persist::save` writes via a `.tmp` sibling + rename, so the watcher
-never observes a half-written file. If you don't want restarts during
-heavy training churn, `systemctl --user stop sighurt-llm.path` pauses
-the watcher (the service keeps serving the currently-loaded weights);
-`systemctl --user start sighurt-llm.path` resumes it.
+The server only reads `model.bin` at startup. Restart it after replacing
+the model. For a minimal systemd deployment and the Discord bot connection
+settings, see [Discord AI server setup](docs/discord-ai-setup.md).
 
 Env vars:
 
@@ -264,8 +245,8 @@ generation primes with `<PERSON_0>` and stops at `</PERSON_0>`. Other
 PERSON ids are arbitrary section-local discriminators (e.g. `<PERSON_2>`
 in section A and section B may be different real speakers).
 
-A bincode cache (`data/dialogs.bin`) is regenerated whenever the text
-file's content hash changes, so corpus edits invalidate the cache
+A local, ignored bincode cache (`data/dialogs.bin`) is regenerated
+whenever the text file's content hash changes, so corpus edits invalidate it
 automatically. Any new tokens appended to the corpus get added to
 `vocab.txt` the next time the data is loaded; that grows the embedding
 table and the output layer (the loader extends them in place rather

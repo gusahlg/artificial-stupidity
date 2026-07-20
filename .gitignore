@@ -7,6 +7,11 @@
 /data/embeddings.db-wal
 /data/embeddings.db-shm
 
+# Generated corpus cache (rebuilt from data/dialogs.txt)
+/data/dialogs.bin
+/data/dialogs.bin.tmp
+/data/dialogs.txt.tmp
+
 # Tooling / staging
 /.pi-stage/
 /.serena/
@@ -20,7 +25,7 @@
 /training-*.log
 /training-*.log.*
 
-# Corpus & vocab snapshot backups (keep the live data/dialogs.* and vocab.txt only)
+# Corpus & vocab snapshot backups (keep the live data/dialogs.txt and vocab.txt only)
 /vocab.txt.pre-*
 /data/dialogs.txt.pre-*
 /data/dialogs.txt.session-P-corpus

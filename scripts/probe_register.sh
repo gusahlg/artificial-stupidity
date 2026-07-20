@@ -8,7 +8,7 @@
 set -euo pipefail
 
 KEY="${SIGHURT_API_KEY:-$(grep ^SIGHURT_API_KEY= ~/.config/sighurt-llm.env | cut -d= -f2)}"
-HOST="${HOST:-http://100.118.41.103:8088}"
+HOST="${HOST:-http://127.0.0.1:8088}"
 N="${SAMPLES:-3}"
 
 probe() {
