@@ -22,6 +22,7 @@
               vulkan-loader
               vulkan-tools
               vulkan-validation-layers
+              python3 # scripts/ingest_oasst.py (full corpus rebuilds)
             ];
 
             shellHook = ''

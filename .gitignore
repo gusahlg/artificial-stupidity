@@ -2,6 +2,7 @@
 
 # Discord / embeddings data (local only)
 /data/discord/
+/data/oasst1.trees.jsonl.gz
 /data/embeddings.db
 /data/embeddings.db-journal
 /data/embeddings.db-wal
@@ -20,12 +21,26 @@
 /model.bin
 /model.bin.*
 
+# Pinned serving snapshot (model + matching corpus), managed by
+# scripts/promote_model.sh — machine-local, never committed.
+/model.serving.bin
+/model.serving.bin.tmp
+/data/dialogs.serving.txt
+/data/dialogs.serving.txt.tmp
+/data/dialogs.serving.bin
+
 # Training run logs
 /training.log
 /training-*.log
 /training-*.log.*
 
-# Corpus & vocab snapshot backups (keep the live data/dialogs.txt and vocab.txt only)
+# The corpus and its derived vocab are now MUTATED weekly by the automated
+# refresh (scripts/refresh_corpus.sh) and rebuilt from the raw TSVs/OASST by
+# scripts/rebuild_full_corpus.sh — the TSVs are the real archive, the txt is
+# derived. Untracked so a stray `git checkout -- data/` can't silently revert
+# converted history while the (gitignored) converter cursors stay advanced.
+/data/dialogs.txt
+/vocab.txt
 /vocab.txt.pre-*
 /data/dialogs.txt.pre-*
 /data/dialogs.txt.session-P-corpus

@@ -9,6 +9,7 @@ use rand::Rng;
 use rand::seq::SliceRandom;
 use rayon::prelude::*;
 use std::collections::HashMap;
+use std::sync::OnceLock;
 use wide::f32x8;
 
 /// SIMD lane count for the Adam inner k-loop. f32x8 corresponds to AVX2 on
@@ -98,6 +99,19 @@ pub const GRAD_CLIP: f32 = 5.0;
 pub const GLOBAL_GRAD_NORM_CLIP: f32 = f32::INFINITY;
 pub const MAX_GENERATION_LEN: usize = 40;
 pub const TOP_K_SAMPLE: usize = 5;
+/// Minimum number of content (non-tag) tokens a generated reply must
+/// contain before the bot's close tag `</PERSON_0>` is allowed to be
+/// sampled. The close-tag probability is zeroed until this many
+/// tokens have been emitted. Kills the degenerate "." / "no."
+/// one-token replies observed at low val loss — the model learns
+/// "close early" as a safe loss-minimizer and this floor forces it
+/// to commit to an actual reply. 4 matches the survey's (§5)
+/// "at least 4–6 content tokens" recommendation, at the permissive
+/// end so short-but-legitimate replies ("yes , why ?") still fit.
+pub const MIN_REPLY_TOKENS: usize = 4;
+/// LayerNorm variance epsilon. Standard 1e-5 (PyTorch default);
+/// guards the 1/√σ² against near-zero variance early in training.
+pub const LN_EPS: f32 = 1e-5;
 /// Cap each training example's target sequence at this many tokens. Merged
 /// Discord turns can be paragraph-length; without a cap, a single example
 /// can drive hundreds of forward+backward steps and stall training. The
@@ -144,6 +158,34 @@ pub struct Layer {
     /// dropout was applied to this forward" — backward then leaves
     /// gradients alone. Runtime-only; never serialized.
     pub last_dropout_mask: Vec<f32>,
+    /// LayerNorm learnable gain γ. **Empty = LayerNorm disabled for
+    /// this layer** — the pre-v5 behavior, and always the case for
+    /// the output layer. When non-empty (length == `rows`), the
+    /// forward becomes `z → LN(z) → activation`: the pre-activation
+    /// vector is mean/variance-normalized to x̂ and the layer emits
+    /// `activation(γ·x̂ + β)`. Persisted in v5 model files.
+    pub ln_gain: Vec<f32>,
+    /// LayerNorm learnable bias β. Same length/emptiness contract as
+    /// `ln_gain`.
+    pub ln_bias: Vec<f32>,
+    /// Adam first/second moments for `ln_gain` / `ln_bias`.
+    /// Persisted in v5 so resumed training keeps warm optimizer
+    /// state, mirroring `w_m`/`w_v`/`b_m`/`b_v`.
+    pub ln_gain_m: Vec<f32>,
+    pub ln_gain_v: Vec<f32>,
+    pub ln_bias_m: Vec<f32>,
+    pub ln_bias_v: Vec<f32>,
+    /// Cached normalized pre-activations x̂ from the most recent
+    /// `cache = true` forward. The LN backward needs exactly x̂ and
+    /// `last_ln_inv_std`; we cache them EXPLICITLY at the point they
+    /// are computed rather than reconstructing them from
+    /// `last_activations` — the 2026-05-20 dropout bug
+    /// (improvement-survey §5b) came from deriving backward inputs
+    /// from a post-transform cache, silently corrupting the tanh
+    /// derivative. Runtime-only; never serialized.
+    pub last_ln_xhat: Vec<f32>,
+    /// Cached `1/√(σ² + LN_EPS)` matching `last_ln_xhat`.
+    pub last_ln_inv_std: f32,
 
     layer_gpu: Option<LayerGpu>,
     matmul_out: Vec<f32>,
@@ -178,6 +220,14 @@ impl Layer {
             last_input: Vec::new(),
             last_activations: Vec::new(),
             last_dropout_mask: Vec::new(),
+            ln_gain: Vec::new(),
+            ln_bias: Vec::new(),
+            ln_gain_m: Vec::new(),
+            ln_gain_v: Vec::new(),
+            ln_bias_m: Vec::new(),
+            ln_bias_v: Vec::new(),
+            last_ln_xhat: Vec::new(),
+            last_ln_inv_std: 0.0,
             layer_gpu,
             matmul_out: vec![0.0; rows],
             gpu_dirty: false,
@@ -206,6 +256,14 @@ impl Layer {
             last_input: Vec::new(),
             last_activations: Vec::new(),
             last_dropout_mask: Vec::new(),
+            ln_gain: Vec::new(),
+            ln_bias: Vec::new(),
+            ln_gain_m: Vec::new(),
+            ln_gain_v: Vec::new(),
+            ln_bias_m: Vec::new(),
+            ln_bias_v: Vec::new(),
+            last_ln_xhat: Vec::new(),
+            last_ln_inv_std: 0.0,
             layer_gpu,
             matmul_out: vec![0.0; rows],
             gpu_dirty: false,
@@ -248,6 +306,14 @@ impl Layer {
             last_input: Vec::new(),
             last_activations: Vec::new(),
             last_dropout_mask: Vec::new(),
+            ln_gain: Vec::new(),
+            ln_bias: Vec::new(),
+            ln_gain_m: Vec::new(),
+            ln_gain_v: Vec::new(),
+            ln_bias_m: Vec::new(),
+            ln_bias_v: Vec::new(),
+            last_ln_xhat: Vec::new(),
+            last_ln_inv_std: 0.0,
             layer_gpu,
             matmul_out: vec![0.0; rows],
             gpu_dirty: false,
@@ -270,6 +336,27 @@ impl Layer {
         }
     }
 
+    /// Is LayerNorm enabled for this layer? Encoded as "non-empty
+    /// gain vector" so v2/v3/v4 loads (which never populate the LN
+    /// fields) automatically get the legacy no-LN forward.
+    pub fn ln_active(&self) -> bool {
+        !self.ln_gain.is_empty()
+    }
+
+    /// Populate LN parameters at identity (γ = 1, β = 0, moments
+    /// zeroed) so the layer's function is initially unchanged apart
+    /// from the normalization itself. Called by
+    /// `Network::enable_layer_norm` at fresh init and usable by the
+    /// persist loader tests.
+    pub fn init_layer_norm(&mut self) {
+        self.ln_gain = vec![1.0; self.rows];
+        self.ln_bias = vec![0.0; self.rows];
+        self.ln_gain_m = vec![0.0; self.rows];
+        self.ln_gain_v = vec![0.0; self.rows];
+        self.ln_bias_m = vec![0.0; self.rows];
+        self.ln_bias_v = vec![0.0; self.rows];
+    }
+
     fn forward(&mut self, gpu: &Gpu, input: &[f32], cache: bool) -> Result<Vec<f32>> {
         debug_assert_eq!(input.len(), self.cols);
         gpu.matvec(
@@ -283,14 +370,52 @@ impl Layer {
         )?;
         self.gpu_dirty = false;
 
+        // Everything past the matvec (bias add, LayerNorm, activation)
+        // runs on the CPU regardless of backend — `gpu.matvec` is a pure
+        // W@x on both paths — so LN produces IDENTICAL math on Vulkan
+        // and CPU and no backend forcing is needed. Keeping the non-LN
+        // arm byte-for-byte the same arithmetic as before v5 also keeps
+        // v2/v3/v4 model files forwarding bit-identically.
         let mut out = Vec::with_capacity(self.rows);
-        for j in 0..self.rows {
-            let z = self.matmul_out[j] + self.biases[j];
-            let a = match self.activation {
-                Activation::Tanh => z.tanh(),
-                Activation::Linear => z,
-            };
-            out.push(a);
+        if self.ln_active() {
+            // z → LN(z) → activation. Compute the full pre-activation
+            // vector first (LN needs the mean/variance across neurons),
+            // then normalize, scale/shift, and activate.
+            for j in 0..self.rows {
+                out.push(self.matmul_out[j] + self.biases[j]);
+            }
+            let h = self.rows as f32;
+            let mean = out.iter().sum::<f32>() / h;
+            let var = out.iter().map(|z| (z - mean) * (z - mean)).sum::<f32>() / h;
+            let inv_std = 1.0 / (var + LN_EPS).sqrt();
+            if cache {
+                self.last_ln_inv_std = inv_std;
+                self.last_ln_xhat.clear();
+                self.last_ln_xhat.reserve(self.rows);
+            }
+            for j in 0..self.rows {
+                let xhat = (out[j] - mean) * inv_std;
+                if cache {
+                    // Cache x̂ EXPLICITLY here, at the point of
+                    // computation — backward must never re-derive it
+                    // from post-transform values (§5b postmortem).
+                    self.last_ln_xhat.push(xhat);
+                }
+                let y = self.ln_gain[j] * xhat + self.ln_bias[j];
+                out[j] = match self.activation {
+                    Activation::Tanh => y.tanh(),
+                    Activation::Linear => y,
+                };
+            }
+        } else {
+            for j in 0..self.rows {
+                let z = self.matmul_out[j] + self.biases[j];
+                let a = match self.activation {
+                    Activation::Tanh => z.tanh(),
+                    Activation::Linear => z,
+                };
+                out.push(a);
+            }
         }
         if cache {
             self.last_input.clear();
@@ -341,16 +466,26 @@ pub struct Network {
     pub adam_step: u64,
     /// Inverted-dropout probability applied to hidden-layer
     /// activations during `forward_and_cache` (the training-time
-    /// forward). 0.0 disables (legacy behavior). `forward` (val /
-    /// generation) ignores this and runs full-strength. Runtime-only;
-    /// never serialized — the user sets it via `--dropout` on every
-    /// run.
+    /// forward). 0.0 disables. `forward` (val / generation) ignores
+    /// this and runs full-strength. **Persisted in v5 model files**: a
+    /// resumed run without `--dropout` keeps the model's saved value
+    /// (so a value baked in by one experiment carries forward until an
+    /// explicit `--dropout 0.0`); v2/v3/v4 files load as 0.0.
     pub dropout_p: f32,
     /// Label smoothing factor α applied to the cross-entropy target
     /// distribution in `compute_deltas_into`. Replaces the one-hot
     /// target with `(1 - α) · one_hot + α · uniform`. 0.0 disables.
-    /// Runtime-only; set via `--label-smoothing F`.
+    /// Set via `--label-smoothing F`; persisted in v5 model files so
+    /// resumed runs default to the value they were trained with.
     pub label_smoothing: f32,
+    /// Master LayerNorm switch. When true, every HIDDEN layer carries
+    /// LN gain/bias parameters (see `Layer::ln_gain`) and applies
+    /// `z → LN(z) → tanh` in its forward. Structural — persisted in
+    /// v5 model files. False for all v2/v3/v4 loads and for
+    /// `network_init` (the trainer opts in via `enable_layer_norm()`
+    /// on fresh init only), so the LIVE v4 production model keeps
+    /// byte-identical forward math.
+    pub layer_norm: bool,
     /// Reusable backward-pass buffers. Held on the network so we don't
     /// allocate per training step. `train_step` `mem::take`s this out so
     /// it can pass `&Network` + `&mut scratch` separately past the borrow
@@ -502,6 +637,22 @@ impl Network {
         Ok(input)
     }
 
+    /// Turn on per-hidden-layer LayerNorm. Intended for FRESH
+    /// networks only (the trainer's `--layer-norm` flag) — flipping
+    /// this on a model trained without LN would abruptly change its
+    /// forward function. Every layer except the output gets identity
+    /// LN parameters (γ = 1, β = 0) with zeroed Adam moments.
+    /// Deliberately a separate method rather than a `network_init`
+    /// parameter so the existing `network_init` signature (called by
+    /// main.rs / serve.rs) stays stable.
+    pub fn enable_layer_norm(&mut self) {
+        self.layer_norm = true;
+        let n = self.layers.len();
+        for layer in &mut self.layers[..n - 1] {
+            layer.init_layer_norm();
+        }
+    }
+
     /// Adam (AdamW-decoupled) update. Per-output-neuron parallelism via rayon
     /// — each row of every layer's weight matrix is independent so the inner
     /// loop scales linearly with cores. The embedding update happens once per
@@ -533,6 +684,13 @@ impl Network {
             for &g in scratch.input_grad.iter() {
                 sq += (g as f64) * (g as f64);
             }
+            // LN parameter gradients participate too (empty vecs when
+            // LayerNorm is off, so this is free for legacy models).
+            for d in scratch.ln_gain_grad.iter().chain(scratch.ln_bias_grad.iter()) {
+                for &g in d.iter() {
+                    sq += (g as f64) * (g as f64);
+                }
+            }
             let norm = sq.sqrt() as f32;
             let clipped = norm > GLOBAL_GRAD_NORM_CLIP && norm.is_finite();
             if clipped {
@@ -544,6 +702,15 @@ impl Network {
                 }
                 for g in scratch.input_grad.iter_mut() {
                     *g *= scale;
+                }
+                for d in scratch
+                    .ln_gain_grad
+                    .iter_mut()
+                    .chain(scratch.ln_bias_grad.iter_mut())
+                {
+                    for g in d.iter_mut() {
+                        *g *= scale;
+                    }
                 }
             }
             self.profile.grad_norm_sum += norm as f64;
@@ -640,6 +807,44 @@ impl Network {
                     }
                 });
             layer.gpu_dirty = true;
+        }
+
+        // LayerNorm gain/bias Adam updates. Frozen (skipped entirely)
+        // when LayerNorm is off — `ln_active()` is false for every
+        // layer of a legacy model, so v2/v3/v4 training behavior is
+        // untouched. Same element-wise GRAD_CLIP clamp as the dense
+        // parameters. NO weight decay here: decaying γ pulls it toward
+        // 0 and fights the normalization itself (standard practice —
+        // AdamW implementations exclude LN parameters from decay).
+        // Serial loop: 2 × rows per hidden layer is trivial next to
+        // the dense update above.
+        if self.layer_norm {
+            for (idx, layer) in self.layers.iter_mut().enumerate() {
+                if !layer.ln_active() {
+                    continue;
+                }
+                let gg = &bp.ln_gain_grad[idx];
+                let bg = &bp.ln_bias_grad[idx];
+                debug_assert_eq!(gg.len(), layer.rows);
+                debug_assert_eq!(bg.len(), layer.rows);
+                for j in 0..layer.rows {
+                    let g = gg[j].clamp(-GRAD_CLIP, GRAD_CLIP);
+                    let m_new = ADAM_BETA1 * layer.ln_gain_m[j] + (1.0 - ADAM_BETA1) * g;
+                    let v_new = ADAM_BETA2 * layer.ln_gain_v[j] + (1.0 - ADAM_BETA2) * g * g;
+                    layer.ln_gain_m[j] = m_new;
+                    layer.ln_gain_v[j] = v_new;
+                    layer.ln_gain[j] -=
+                        lr * (m_new / bc1) / ((v_new / bc2).sqrt() + ADAM_EPS);
+
+                    let g = bg[j].clamp(-GRAD_CLIP, GRAD_CLIP);
+                    let m_new = ADAM_BETA1 * layer.ln_bias_m[j] + (1.0 - ADAM_BETA1) * g;
+                    let v_new = ADAM_BETA2 * layer.ln_bias_v[j] + (1.0 - ADAM_BETA2) * g * g;
+                    layer.ln_bias_m[j] = m_new;
+                    layer.ln_bias_v[j] = v_new;
+                    layer.ln_bias[j] -=
+                        lr * (m_new / bc1) / ((v_new / bc2).sqrt() + ADAM_EPS);
+                }
+            }
         }
         self.profile.adam_dense_ns += t_adam_dense.elapsed().as_nanos();
 
@@ -798,6 +1003,7 @@ pub fn network_init(
         adam_step: 0,
         dropout_p: 0.0,
         label_smoothing: 0.0,
+        layer_norm: false,
         backprop_scratch: crate::teacher::BackpropScratch::default(),
         profile: StepProfile::default(),
     })
@@ -811,6 +1017,179 @@ fn mask_forbidden(probs: &mut [f32], forbidden_ids: &[usize]) {
         if i < probs.len() {
             probs[i] = 0.0;
         }
+    }
+}
+
+/// Cached `SIGHURT_TEMPERATURE` (sampling temperature, default 1.0).
+/// Read ONCE per process via `OnceLock` — generation is per-token and
+/// `std::env::var` costs a lock + allocation per call, which is
+/// pointless for a value that never changes mid-run. Non-numeric,
+/// non-finite, or non-positive values fall back to 1.0 (off).
+static SAMPLING_TEMPERATURE: OnceLock<f32> = OnceLock::new();
+fn sampling_temperature() -> f32 {
+    *SAMPLING_TEMPERATURE.get_or_init(|| {
+        std::env::var("SIGHURT_TEMPERATURE")
+            .ok()
+            .and_then(|s| s.trim().parse::<f32>().ok())
+            .filter(|t| t.is_finite() && *t > 0.0)
+            .unwrap_or(1.0)
+    })
+}
+
+/// Cached `SIGHURT_TOP_P` (nucleus sampling mass, in (0, 1]). `None`
+/// (unset or out of range) keeps the legacy top-k=5 behavior. Same
+/// read-once rationale as `SAMPLING_TEMPERATURE`.
+static SAMPLING_TOP_P: OnceLock<Option<f32>> = OnceLock::new();
+fn sampling_top_p() -> Option<f32> {
+    *SAMPLING_TOP_P.get_or_init(|| {
+        std::env::var("SIGHURT_TOP_P")
+            .ok()
+            .and_then(|s| s.trim().parse::<f32>().ok())
+            .filter(|p| p.is_finite() && *p > 0.0 && *p <= 1.0)
+    })
+}
+
+/// Temperature reshaping on an (possibly unnormalized) probability
+/// vector: `p_i → p_i^(1/T)`, then renormalize to sum 1. Operating on
+/// probabilities rather than logits is equivalent to the usual
+/// `logits/T` formulation up to the shared softmax normalizer, and the
+/// probs are what we have here (the network's forward already applied
+/// softmax). T < 1 sharpens, T > 1 flattens, T = 1 is a no-op and is
+/// skipped entirely so the default path costs nothing.
+fn apply_temperature(probs: &mut [f32], temperature: f32) {
+    if !(temperature > 0.0) || (temperature - 1.0).abs() < 1e-6 {
+        return;
+    }
+    let inv_t = 1.0 / temperature;
+    let mut sum = 0.0f32;
+    for p in probs.iter_mut() {
+        // powf(0, x) = 0 for x > 0, so masked-out entries stay masked.
+        *p = p.max(0.0).powf(inv_t);
+        sum += *p;
+    }
+    if sum > 0.0 {
+        let inv = 1.0 / sum;
+        for p in probs.iter_mut() {
+            *p *= inv;
+        }
+    }
+}
+
+/// Nucleus (top-p) sampling: sort descending, take the smallest prefix
+/// whose cumulative mass reaches `top_p` of the TOTAL remaining mass
+/// (the vector arrives masked/penalized, hence unnormalized — using a
+/// fraction of the total is equivalent to renormalizing first), then
+/// sample proportionally within that prefix. Falls back like
+/// `sample_top_k`: empty/degenerate input returns index 0 / the
+/// highest-probability index.
+fn sample_top_p(probs: &[f32], top_p: f32) -> usize {
+    let mut pairs: Vec<(f32, usize)> = probs
+        .iter()
+        .enumerate()
+        .filter(|(_, p)| p.is_finite() && **p > 0.0)
+        .map(|(i, p)| (*p, i))
+        .collect();
+    if pairs.is_empty() {
+        return 0;
+    }
+    pairs.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    let total: f32 = pairs.iter().map(|(p, _)| *p).sum();
+    if total <= 0.0 {
+        return pairs[0].1;
+    }
+    let threshold = top_p * total;
+    let mut cut = pairs.len();
+    let mut cum = 0.0f32;
+    for (i, (p, _)) in pairs.iter().enumerate() {
+        cum += *p;
+        if cum >= threshold {
+            cut = i + 1;
+            break;
+        }
+    }
+    let nucleus = &pairs[..cut];
+    let sum: f32 = nucleus.iter().map(|(p, _)| *p).sum();
+    if sum <= 0.0 {
+        return nucleus[0].1;
+    }
+    let mut r = rand::thread_rng().gen_range(0.0..sum);
+    for (p, i) in nucleus {
+        r -= *p;
+        if r <= 0.0 {
+            return *i;
+        }
+    }
+    // Floating-point drift fallback, mirroring `sample_top_k`.
+    nucleus[0].1
+}
+
+/// The ONE sampling pipeline, shared by `generate` and the
+/// free-running branch of `generate_and_train`. Historically the two
+/// diverged — `generate_and_train` was missing the repetition penalty
+/// — and per-path tweaks kept drifting; every masking/penalty/
+/// temperature/truncation step now lives here, in order:
+///
+/// 1. forbidden-token mask (PAD/UNK/tags/placeholders),
+/// 2. minimum-reply-length mask (`</PERSON_0>` zeroed until
+///    `emitted_tokens >= MIN_REPLY_TOKENS`),
+/// 3. repetition penalty over `recent_ids`,
+/// 4. temperature reshaping (`SIGHURT_TEMPERATURE`),
+/// 5. nucleus sampling when `SIGHURT_TOP_P` is set, else top-k=5.
+///
+/// `emitted_tokens` counts non-tag tokens already produced this reply
+/// (tags never reach the produced list, so `produced.len()` is exactly
+/// that count). `probs` is consumed destructively.
+fn sample_reply_token(
+    probs: &mut [f32],
+    vocab: &VocabIndex<'_>,
+    recent_ids: &[usize],
+    emitted_tokens: usize,
+) -> usize {
+    mask_forbidden(probs, &vocab.forbidden_emit_ids);
+    // Best legal (non-forbidden) token BEFORE the destructive min-length /
+    // penalty / temperature steps. This is the safety net: those steps can
+    // legitimately drive the whole vector to zero — the min-length mask
+    // zeroes the close tag when it holds ~all the mass early in a reply,
+    // and `apply_temperature`'s p^(1/T) underflows tiny residual mass to
+    // exactly 0.0 in f32 at low temperatures. Without a fallback the
+    // samplers would return index 0 (`<PAD>`), bypassing the forbidden
+    // mask and spraying `<PAD>` into the reply. Instead we fall back to
+    // this token, which the model actually wanted and which is guaranteed
+    // legal (or a stop when literally nothing is legal).
+    let (best_legal_idx, best_legal_val) = probs
+        .iter()
+        .copied()
+        .enumerate()
+        .filter(|(_, p)| p.is_finite())
+        .fold((usize::MAX, 0.0f32), |(bi, bv), (i, p)| {
+            if p > bv { (i, p) } else { (bi, bv) }
+        });
+    if best_legal_val <= 0.0 {
+        // Model put all its mass on forbidden tokens — no legal
+        // continuation exists. Signal a clean stop (out-of-range index).
+        return probs.len();
+    }
+
+    if emitted_tokens < MIN_REPLY_TOKENS {
+        if let Some(close_id) = vocab.bot_close_id {
+            if close_id < probs.len() {
+                probs[close_id] = 0.0;
+            }
+        }
+    }
+    apply_repetition_penalty(probs, recent_ids, REPETITION_PENALTY);
+    apply_temperature(probs, sampling_temperature());
+
+    // If the pipeline zeroed everything, take the pre-mask legal argmax
+    // rather than letting the samplers fall through to index 0 (`<PAD>`).
+    let has_mass = probs.iter().any(|p| p.is_finite() && *p > 0.0);
+    if !has_mass {
+        return best_legal_idx;
+    }
+
+    match sampling_top_p() {
+        Some(p) => sample_top_p(probs, p),
+        None => sample_top_k(probs, TOP_K_SAMPLE),
     }
 }
 
@@ -845,9 +1224,21 @@ fn sample_top_k(probs: &[f32], k: usize) -> usize {
 
 fn detokenize(tokens: &[String]) -> String {
     let mut out = String::new();
+    // "@" glues to the token AFTER it: the corpus now contains
+    // learnable `@name` mention tokens which the punctuation-splitting
+    // tokenizer shatters into "@" + "name", and rendering them as
+    // "hey@ gustav" (the old generic-punctuation rule: no space
+    // before, space after) reads wrong. We want "hey @gustav" —
+    // space BEFORE the "@", none after.
+    let mut glue_next = false;
     for tok in tokens {
         let is_punct = tok.chars().all(|c| !c.is_alphanumeric() && c != '\'');
         if out.is_empty() {
+            out.push_str(tok);
+        } else if glue_next {
+            out.push_str(tok);
+        } else if tok == "@" {
+            out.push(' ');
             out.push_str(tok);
         } else if is_punct {
             out.push_str(tok);
@@ -855,6 +1246,7 @@ fn detokenize(tokens: &[String]) -> String {
             out.push(' ');
             out.push_str(tok);
         }
+        glue_next = tok == "@";
     }
     out
 }
@@ -884,9 +1276,7 @@ pub fn generate(
     for i in 0..MAX_GENERATION_LEN {
         let window = build_token_window(&context, &vocab, CONTEXT_WINDOW);
         let mut probs = net.forward(gpu, &window, i)?;
-        mask_forbidden(&mut probs, &vocab.forbidden_emit_ids);
-        apply_repetition_penalty(&mut probs, &recent_ids, REPETITION_PENALTY);
-        let idx = sample_top_k(&probs, TOP_K_SAMPLE);
+        let idx = sample_reply_token(&mut probs, &vocab, &recent_ids, produced.len());
         if idx >= words.len() {
             break;
         }
@@ -965,6 +1355,17 @@ pub fn generate_and_train(
         targets.push(bot_close.clone());
     }
 
+    // Repetition window shared across the teacher-forced and
+    // free-running phases so the penalty sees a continuous stream of
+    // recent emissions when the model takes over from the teacher.
+    let mut recent_ids: Vec<usize> = Vec::with_capacity(REPETITION_WINDOW);
+    let push_recent = |recent_ids: &mut Vec<usize>, id: usize| {
+        if recent_ids.len() >= REPETITION_WINDOW {
+            recent_ids.remove(0);
+        }
+        recent_ids.push(id);
+    };
+
     for i in 0..MAX_GENERATION_LEN {
         let window = build_token_window(&context, &vocab, CONTEXT_WINDOW);
 
@@ -973,6 +1374,7 @@ pub fn generate_and_train(
                 let _probs = net.forward_and_cache(gpu, &window, i)?;
                 if let Some(target_id) = vocab.lookup(t) {
                     net.train_step(lr, target_id);
+                    push_recent(&mut recent_ids, target_id);
                 }
                 if t == &bot_close {
                     break;
@@ -981,13 +1383,21 @@ pub fn generate_and_train(
                 produced.push(t.clone());
             }
             None => {
+                // Free-running: same shared sampling pipeline as
+                // `generate` (this branch historically lacked the
+                // repetition penalty — a known divergence, now fixed
+                // by construction).
                 let mut probs = net.forward(gpu, &window, i)?;
-                mask_forbidden(&mut probs, &vocab.forbidden_emit_ids);
-                let idx = sample_top_k(&probs, TOP_K_SAMPLE);
+                let idx =
+                    sample_reply_token(&mut probs, &vocab, &recent_ids, produced.len());
+                if idx >= words.len() {
+                    break;
+                }
                 let next = &words[idx];
                 if next == &bot_close {
                     break;
                 }
+                push_recent(&mut recent_ids, idx);
                 context.push(next.clone());
                 produced.push(next.clone());
             }
@@ -1315,5 +1725,159 @@ mod tests {
         let mut probs = vec![1.0, 1.0];
         apply_repetition_penalty(&mut probs, &[0, 5, 9], 0.5);
         assert_eq!(probs, vec![0.5, 1.0]);
+    }
+
+    fn toks(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn detokenize_glues_mention_after_at_sign() {
+        // The corpus contains learnable `@name` mention tokens which the
+        // tokenizer splits into "@" + "name"; rendering must not insert
+        // a space after the "@" (and must keep one before it).
+        assert_eq!(detokenize(&toks(&["hey", "@", "gustav"])), "hey @gustav");
+    }
+
+    #[test]
+    fn detokenize_at_sign_at_reply_start() {
+        assert_eq!(detokenize(&toks(&["@", "gustav", "hi"])), "@gustav hi");
+    }
+
+    #[test]
+    fn detokenize_ordinary_punctuation_unchanged() {
+        // Regression guard: the "@" special case must not disturb the
+        // existing no-space-before-punctuation rendering.
+        assert_eq!(detokenize(&toks(&["hello", ",", "world", "!"])), "hello, world!");
+    }
+
+    #[test]
+    fn temperature_unity_is_noop() {
+        let mut probs = vec![0.8, 0.2];
+        apply_temperature(&mut probs, 1.0);
+        assert_eq!(probs, vec![0.8, 0.2]);
+    }
+
+    #[test]
+    fn temperature_below_one_sharpens_and_renormalizes() {
+        // T = 0.5 → p^2, renormalized: [0.64, 0.04] / 0.68.
+        let mut probs = vec![0.8, 0.2];
+        apply_temperature(&mut probs, 0.5);
+        assert!((probs[0] - 0.64 / 0.68).abs() < 1e-5);
+        assert!((probs[1] - 0.04 / 0.68).abs() < 1e-5);
+        let sum: f32 = probs.iter().sum();
+        assert!((sum - 1.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn temperature_above_one_flattens() {
+        // T = 2 → sqrt, renormalized — the gap between the two entries
+        // must shrink but the ordering must hold.
+        let mut probs = vec![0.9, 0.1];
+        apply_temperature(&mut probs, 2.0);
+        assert!(probs[0] > probs[1]);
+        assert!(probs[0] < 0.9);
+        assert!(probs[1] > 0.1);
+    }
+
+    #[test]
+    fn top_p_takes_smallest_sufficient_prefix() {
+        // Sorted mass: 0.6, 0.3, 0.1. top_p = 0.5 → nucleus is just the
+        // argmax, so sampling is deterministic.
+        let probs = vec![0.1, 0.6, 0.3];
+        for _ in 0..20 {
+            assert_eq!(sample_top_p(&probs, 0.5), 1);
+        }
+    }
+
+    #[test]
+    fn top_p_excludes_tail_tokens() {
+        // top_p = 0.9 → nucleus {0.6, 0.3}; index 0 (0.1) must never
+        // be sampled.
+        let probs = vec![0.1, 0.6, 0.3];
+        for _ in 0..100 {
+            let idx = sample_top_p(&probs, 0.9);
+            assert!(idx == 1 || idx == 2, "sampled outside nucleus: {}", idx);
+        }
+    }
+
+    #[test]
+    fn top_p_works_on_unnormalized_mass() {
+        // Masking/penalties leave the vector unnormalized; the nucleus
+        // threshold is a FRACTION of the remaining total, so scaling
+        // everything by 10 must not change the outcome.
+        let probs = vec![1.0, 6.0, 3.0];
+        for _ in 0..20 {
+            assert_eq!(sample_top_p(&probs, 0.5), 1);
+        }
+    }
+
+    /// Vocab fixture with the bot's close tag at index 4 and content
+    /// tokens at 5/6, mirroring the production layout.
+    fn min_len_vocab() -> Vec<String> {
+        toks(&[
+            "<PAD>",
+            "<UNK>",
+            "<SEC>",
+            "<PERSON_0>",
+            "</PERSON_0>",
+            "hello",
+            "world",
+        ])
+    }
+
+    #[test]
+    fn min_reply_length_masks_bot_close_early() {
+        let words = min_len_vocab();
+        let vi = VocabIndex::new(&words);
+        assert_eq!(vi.bot_close_id, Some(4));
+        // The close tag dominates the distribution — without the
+        // minimum-length mask it would be sampled essentially always.
+        let base = vec![0.0, 0.0, 0.0, 0.0, 0.97, 0.02, 0.01];
+        for emitted in 0..MIN_REPLY_TOKENS {
+            for _ in 0..25 {
+                let mut probs = base.clone();
+                let idx = sample_reply_token(&mut probs, &vi, &[], emitted);
+                assert_ne!(idx, 4, "close tag sampled at emitted={}", emitted);
+            }
+        }
+    }
+
+    #[test]
+    fn min_reply_length_allows_bot_close_after_threshold() {
+        let words = min_len_vocab();
+        let vi = VocabIndex::new(&words);
+        let mut probs = vec![0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0];
+        let idx = sample_reply_token(&mut probs, &vi, &[], MIN_REPLY_TOKENS);
+        assert_eq!(idx, 4, "close tag must be samplable once the floor is met");
+    }
+
+    #[test]
+    fn degenerate_all_mass_on_close_never_emits_pad() {
+        // The close tag holds ALL the mass and we're below the min-length
+        // floor, so the min-length mask zeroes the only nonzero entry. The
+        // sampler must NOT fall through to index 0 (`<PAD>`); it falls back
+        // to the pre-mask legal argmax (the close tag = clean stop).
+        let words = min_len_vocab();
+        let vi = VocabIndex::new(&words);
+        for _ in 0..50 {
+            let mut probs = vec![0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0];
+            let idx = sample_reply_token(&mut probs, &vi, &[], 0);
+            assert_ne!(idx, 0, "must never emit <PAD>");
+            assert_eq!(idx, 4, "falls back to the legal argmax (close = stop)");
+        }
+    }
+
+    #[test]
+    fn all_mass_on_forbidden_signals_stop() {
+        // Model put everything on forbidden tokens (e.g. a PERSON open
+        // tag). No legal continuation exists → return an out-of-range
+        // index so the generate loop stops cleanly instead of emitting junk.
+        let words = min_len_vocab();
+        let vi = VocabIndex::new(&words);
+        // index 1 = <UNK> (forbidden), everything else zero.
+        let mut probs = vec![0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let idx = sample_reply_token(&mut probs, &vi, &[], MIN_REPLY_TOKENS);
+        assert!(idx >= words.len(), "no legal token -> stop sentinel");
     }
 }

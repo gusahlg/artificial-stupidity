@@ -109,13 +109,32 @@ struct Args {
     lr_min: f32,
     /// Dropout rate on hidden-layer activations during training. 0
     /// disables (legacy behavior). 0.1–0.3 typical for over-fit
-    /// MLPs. Always disabled in the validation pass.
-    dropout: f32,
+    /// MLPs. Always disabled in the validation pass. `None` = flag
+    /// not given: the value persisted in the loaded v5 model (0.0
+    /// for fresh init / v2-v4 files) is kept, so a resumed run
+    /// defaults to what it was trained with. `Some(x)` (explicit
+    /// `--dropout x`) always overrides.
+    dropout: Option<f32>,
     /// Label smoothing α applied to cross-entropy targets. 0
     /// disables. 0.1 is a typical LM value; sometimes 0.05 works
     /// better when the corpus is small (avoids over-flattening the
-    /// learning signal).
-    label_smoothing: f32,
+    /// learning signal). Same `None`-keeps-persisted-value semantics
+    /// as `dropout`.
+    label_smoothing: Option<f32>,
+    /// Enable per-hidden-layer LayerNorm — FRESH INIT ONLY. When a
+    /// model is loaded from disk this flag is ignored (with a
+    /// warning) unless the loaded model already has LN, because
+    /// bolting LN onto weights trained without it abruptly changes
+    /// the forward function. Needs the v5 model format to persist
+    /// the LN gain/bias parameters.
+    layer_norm: bool,
+    /// Allow a fresh random init to REPLACE a model file that exists but
+    /// fails to load (vocab-hash mismatch after a corpus/vocab reorder,
+    /// shape change, or corruption). Without this, an unusable-but-present
+    /// checkpoint is a hard error rather than being silently discarded and
+    /// clobbered on the first save — the whole point of the v4/v5 vocab
+    /// hash is to refuse, not to quietly throw away trained weights.
+    force_fresh: bool,
 }
 
 impl Args {
@@ -133,8 +152,10 @@ impl Args {
             lr_warmup_epochs: 0,
             lr_anneal_epochs: 0,
             lr_min: 0.0,
-            dropout: 0.0,
-            label_smoothing: 0.0,
+            dropout: None,
+            label_smoothing: None,
+            layer_norm: false,
+            force_fresh: false,
         };
         let mut it = std::env::args().skip(1);
         while let Some(flag) = it.next() {
@@ -159,11 +180,19 @@ impl Args {
                     a.lr_anneal_epochs = it.next().unwrap().parse().unwrap()
                 }
                 "--lr-min" => a.lr_min = it.next().unwrap().parse().unwrap(),
-                "--dropout" => a.dropout = it.next().unwrap().parse().unwrap(),
-                "--label-smoothing" => a.label_smoothing = it.next().unwrap().parse().unwrap(),
+                "--dropout" => a.dropout = Some(it.next().unwrap().parse().unwrap()),
+                "--label-smoothing" => {
+                    a.label_smoothing = Some(it.next().unwrap().parse().unwrap())
+                }
+                "--layer-norm" => a.layer_norm = true,
+                "--force-fresh" => a.force_fresh = true,
                 "--help" | "-h" => {
                     println!(
-                        "train [--epochs N] [--lr F] [--save-every N] [--prelude-drop F] [--sample-every N] [--lr-decay F] [--val-frac F] [--max-train-examples N] [--max-val-examples N] [--lr-warmup-epochs N] [--lr-anneal-epochs N] [--lr-min F] [--dropout F] [--label-smoothing F]"
+                        "train [--epochs N] [--lr F] [--save-every N] [--prelude-drop F] [--sample-every N] [--lr-decay F] [--val-frac F] [--max-train-examples N] [--max-val-examples N] [--lr-warmup-epochs N] [--lr-anneal-epochs N] [--lr-min F] [--dropout F] [--label-smoothing F] [--layer-norm] [--force-fresh]\n\
+                         Note: dropout/label-smoothing persist into model.bin (v5); an unflagged \
+                         resume keeps the model's saved values. A present-but-unusable model.bin \
+                         (vocab reorder / shape change / corruption) is a hard error unless \
+                         --force-fresh is given (which discards it and trains from scratch)."
                     );
                     std::process::exit(0);
                 }
@@ -228,9 +257,14 @@ fn main() -> Result<()> {
         vocab_hash,
     };
 
+    // Whether we resumed from an on-disk checkpoint. Gates the
+    // `--layer-norm` flag below: LN is a structural change that can
+    // only be applied at fresh init.
+    let mut loaded_from_disk = false;
     let mut net = match persist::load_with_vocab(MODEL_PATH, &gpu, shape, Some(&vocab)) {
         Ok(Some(n)) => {
             println!("Loaded existing model from {MODEL_PATH}; continuing training.");
+            loaded_from_disk = true;
             n
         }
         Ok(None) => {
@@ -245,7 +279,22 @@ fn main() -> Result<()> {
             )?
         }
         Err(e) => {
-            println!("Saved model unusable ({e}); initializing fresh.");
+            // The file exists but won't load — almost always a vocab-hash
+            // mismatch after a corpus/vocab reorder (the v4/v5 hash exists
+            // precisely to catch this), or corruption. Refusing here is the
+            // point: fresh-init would train random weights and the first
+            // save would OVERWRITE the trained checkpoint, destroying it.
+            // Require an explicit opt-in to discard it.
+            if !args.force_fresh {
+                anyhow::bail!(
+                    "{MODEL_PATH} exists but failed to load: {e}\n\
+                     This is usually a vocab reorder after a corpus refresh. Refusing to \
+                     silently discard and overwrite the trained checkpoint.\n\
+                     Options:\n  - move it aside:  mv {MODEL_PATH} {MODEL_PATH}.stale\n  \
+                     - train fresh in place: rerun with --force-fresh (DISCARDS {MODEL_PATH})"
+                );
+            }
+            println!("Saved model unusable ({e}); --force-fresh given, initializing fresh.");
             network_init(
                 &gpu,
                 EMBED_DIM,
@@ -256,6 +305,29 @@ fn main() -> Result<()> {
             )?
         }
     };
+
+    // LayerNorm wiring. Fresh init: opt in via the flag. Loaded model:
+    // its persisted structure wins — a v5-with-LN model keeps LN on
+    // regardless of flags, and `--layer-norm` on a model trained
+    // without LN is refused (identity-initialized LN would still
+    // change the forward function through the normalization itself,
+    // instantly invalidating the trained weights).
+    if args.layer_norm {
+        if loaded_from_disk {
+            if net.layer_norm {
+                println!("Loaded model already has LayerNorm; --layer-norm is redundant.");
+            } else {
+                eprintln!(
+                    "warn: --layer-norm ignored — the loaded model was trained without \
+                     LayerNorm and it can only be enabled at fresh init. Move {MODEL_PATH} \
+                     aside to train a fresh LayerNorm model."
+                );
+            }
+        } else {
+            net.enable_layer_norm();
+        }
+    }
+    println!("LayerNorm: {}", if net.layer_norm { "on" } else { "off" });
 
     let mut examples = extract_train_examples(&dialog);
     let total = examples.len();
@@ -315,16 +387,24 @@ fn main() -> Result<()> {
         }
         None => f64::INFINITY,
     };
-    // Wire dropout into the network from the CLI. The field is
-    // runtime-only — every fresh `train` invocation re-sets it.
-    net.dropout_p = args.dropout;
-    if args.dropout > 0.0 {
-        println!("Dropout enabled: p = {:.2}", args.dropout);
+    // Wire dropout / label smoothing. Since v5 both are persisted in
+    // the model file, so the values a checkpoint was trained with
+    // become the session defaults; an explicit CLI flag overrides.
+    // (v2/v3/v4 checkpoints and fresh inits carry 0.0, reproducing
+    // the old "off unless flagged" behavior.)
+    if let Some(d) = args.dropout {
+        net.dropout_p = d;
     }
-    net.label_smoothing = args.label_smoothing;
-    if args.label_smoothing > 0.0 {
-        println!("Label smoothing enabled: α = {:.3}", args.label_smoothing);
+    if let Some(a) = args.label_smoothing {
+        net.label_smoothing = a;
     }
+    println!(
+        "Effective dropout p = {:.3} ({}), label smoothing α = {:.3} ({})",
+        net.dropout_p,
+        if args.dropout.is_some() { "CLI" } else { "persisted/default" },
+        net.label_smoothing,
+        if args.label_smoothing.is_some() { "CLI" } else { "persisted/default" },
+    );
     if args.lr_anneal_epochs > 0 {
         println!(
             "LR schedule: warmup {} epochs → cosine over {} epochs to lr_min={:.6}",

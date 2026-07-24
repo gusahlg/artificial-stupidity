@@ -20,10 +20,26 @@ const MAGIC: u32 = 0x4D4F_444C; // "MODL"
 ///     v4 catches this at load time and refuses rather than letting it
 ///     happen quietly. v2 and v3 files still load (no hash → skip
 ///     check) for back-compat.
+/// v5: v4 + training hyperparameters and optional LayerNorm. After the
+///     v4 header fields (…, adam_step, vocab_hash) come three new
+///     scalars: `dropout_p: f32`, `label_smoothing: f32`,
+///     `layer_norm: u8` (0/1). The per-layer payload matches v4
+///     (rows, cols, activation, weights, biases, w_m, w_v, b_m, b_v),
+///     and when `layer_norm == 1` every HIDDEN layer (all but the
+///     last) additionally carries six `rows`-length vectors right
+///     after `b_v`: ln_gain, ln_bias, ln_gain_m, ln_gain_v,
+///     ln_bias_m, ln_bias_v — parameters AND Adam moments, mirroring
+///     how weights/biases persist, so resumed training is exact.
+///     dropout_p/label_smoothing persisting means a resumed run
+///     defaults to the values it was trained with instead of silently
+///     reverting to 0. v2/v3/v4 files still load (dropout_p =
+///     label_smoothing = 0.0, LayerNorm off) with byte-identical
+///     forward behavior — the LIVE production model is a v4 file.
 const VERSION_V2: u32 = 2;
 const VERSION_V3: u32 = 3;
 const VERSION_V4: u32 = 4;
-const VERSION_CURRENT: u32 = VERSION_V4;
+const VERSION_V5: u32 = 5;
+const VERSION_CURRENT: u32 = VERSION_V5;
 
 /// Stable u64 hash over the ordered, prefix-bounded vocab list. Used by
 /// the v4 model format to detect silent vocab reorderings after corpus
@@ -73,6 +89,15 @@ fn read_u8<R: Read>(r: &mut R) -> Result<u8> {
     r.read_exact(&mut b)?;
     Ok(b[0])
 }
+fn write_f32<W: Write>(w: &mut W, v: f32) -> Result<()> {
+    w.write_all(&v.to_le_bytes())?;
+    Ok(())
+}
+fn read_f32<R: Read>(r: &mut R) -> Result<f32> {
+    let mut b = [0u8; 4];
+    r.read_exact(&mut b)?;
+    Ok(f32::from_le_bytes(b))
+}
 fn write_f32_slice<W: Write>(w: &mut W, data: &[f32]) -> Result<()> {
     let bytes: &[u8] =
         unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4) };
@@ -103,11 +128,13 @@ fn activation_from_code(c: u8) -> Result<Activation> {
     }
 }
 
-/// Save the network at `path`. Always writes the current version (v4),
-/// including Adam moments, the global Adam step counter, and a hash
-/// over the vocab list so a later load can detect silent vocab
-/// reorderings. The file roughly triples in size vs v2 (weights +
-/// m + v ≈ 3× the v2 payload).
+/// Save the network at `path`. Always writes the current version (v5),
+/// including Adam moments, the global Adam step counter, a hash over
+/// the vocab list so a later load can detect silent vocab
+/// reorderings, the dropout/label-smoothing hyperparameters, and —
+/// when the network has LayerNorm — the per-hidden-layer LN
+/// parameters plus their Adam moments. The file roughly triples in
+/// size vs v2 (weights + m + v ≈ 3× the v2 payload).
 ///
 /// Atomic via temp-file + rename: the bytes are written to
 /// `<path>.tmp` and then renamed onto `<path>` so an external watcher
@@ -131,6 +158,10 @@ pub fn save<P: AsRef<Path>>(net: &Network, path: P, vocab_hash: u64) -> Result<(
         write_u32(&mut w, net.hidden_layers as u32)?;
         write_u64(&mut w, net.adam_step)?;
         write_u64(&mut w, vocab_hash)?;
+        // v5 additions: training hyperparameters + LayerNorm flag.
+        write_f32(&mut w, net.dropout_p)?;
+        write_f32(&mut w, net.label_smoothing)?;
+        write_u8(&mut w, u8::from(net.layer_norm))?;
 
         // Embedding: weights + Adam moments.
         write_f32_slice(&mut w, &net.embedding.weights)?;
@@ -138,8 +169,11 @@ pub fn save<P: AsRef<Path>>(net: &Network, path: P, vocab_hash: u64) -> Result<(
         write_f32_slice(&mut w, &net.embedding.v)?;
 
         // Dense layers: weights, biases + Adam moments per layer.
-        write_u32(&mut w, net.layers.len() as u32)?;
-        for layer in &net.layers {
+        // When layer_norm is on, hidden layers (all but the last)
+        // additionally carry the six LN vectors after b_v.
+        let layer_count = net.layers.len();
+        write_u32(&mut w, layer_count as u32)?;
+        for (i, layer) in net.layers.iter().enumerate() {
             write_u32(&mut w, layer.rows as u32)?;
             write_u32(&mut w, layer.cols as u32)?;
             write_u8(&mut w, activation_code(layer.activation))?;
@@ -149,6 +183,15 @@ pub fn save<P: AsRef<Path>>(net: &Network, path: P, vocab_hash: u64) -> Result<(
             write_f32_slice(&mut w, &layer.w_v)?;
             write_f32_slice(&mut w, &layer.b_m)?;
             write_f32_slice(&mut w, &layer.b_v)?;
+            if net.layer_norm && i < layer_count - 1 {
+                debug_assert_eq!(layer.ln_gain.len(), layer.rows);
+                write_f32_slice(&mut w, &layer.ln_gain)?;
+                write_f32_slice(&mut w, &layer.ln_bias)?;
+                write_f32_slice(&mut w, &layer.ln_gain_m)?;
+                write_f32_slice(&mut w, &layer.ln_gain_v)?;
+                write_f32_slice(&mut w, &layer.ln_bias_m)?;
+                write_f32_slice(&mut w, &layer.ln_bias_v)?;
+            }
         }
         w.flush()?;
         // Drop the BufWriter (and inner File) here so the rename below
@@ -180,7 +223,7 @@ pub struct LoadedShape {
     pub vocab_hash: u64,
 }
 
-/// Load a v2, v3, or v4 model. Vocab growth (saved vocab < expected
+/// Load a v2, v3, v4, or v5 model. Vocab growth (saved vocab < expected
 /// vocab) is handled by extending the embedding table and the output
 /// layer with fresh random rows (and zeroed Adam moments for those
 /// new rows); the rest of the structure must match exactly.
@@ -229,12 +272,14 @@ pub fn load_with_vocab<P: AsRef<Path>>(
         VERSION_V2 => load_v2(&mut r, gpu, expected).map(Some),
         VERSION_V3 => load_v3(&mut r, gpu, expected).map(Some),
         VERSION_V4 => load_v4(&mut r, gpu, expected, vocab).map(Some),
+        VERSION_V5 => load_v5(&mut r, gpu, expected, vocab).map(Some),
         v => bail!(
-            "model file version {} not supported (expected {}, {}, or {})",
+            "model file version {} not supported (expected {}, {}, {}, or {})",
             v,
             VERSION_V2,
             VERSION_V3,
             VERSION_V4,
+            VERSION_V5,
         ),
     }
 }
@@ -382,6 +427,7 @@ fn load_v2<R: Read>(r: &mut R, gpu: &Gpu, expected: LoadedShape) -> Result<Netwo
         adam_step: 0,
         dropout_p: 0.0,
         label_smoothing: 0.0,
+        layer_norm: false,
         backprop_scratch: crate::teacher::BackpropScratch::default(),
         profile: crate::neural_network::StepProfile::default(),
     })
@@ -448,6 +494,7 @@ fn load_v3<R: Read>(r: &mut R, gpu: &Gpu, expected: LoadedShape) -> Result<Netwo
         adam_step,
         dropout_p: 0.0,
         label_smoothing: 0.0,
+        layer_norm: false,
         backprop_scratch: crate::teacher::BackpropScratch::default(),
         profile: crate::neural_network::StepProfile::default(),
     })
@@ -560,6 +607,129 @@ fn load_v4<R: Read>(
         adam_step,
         dropout_p: 0.0,
         label_smoothing: 0.0,
+        layer_norm: false,
+        backprop_scratch: crate::teacher::BackpropScratch::default(),
+        profile: crate::neural_network::StepProfile::default(),
+    })
+}
+
+/// v5 = v4 + (dropout_p, label_smoothing, layer_norm) scalars after
+/// the header, and per-HIDDEN-layer LN parameter/Adam-moment vectors
+/// after each layer's b_v when layer_norm is set. See the version
+/// ladder comment at the top of this file for the exact layout.
+fn load_v5<R: Read>(
+    r: &mut R,
+    gpu: &Gpu,
+    expected: LoadedShape,
+    current_vocab: Option<&[String]>,
+) -> Result<Network> {
+    let h = read_header(r, &expected)?;
+    let adam_step = read_u64(r)?;
+    let saved_vocab_hash = read_u64(r)?;
+    let dropout_p = read_f32(r)?;
+    let label_smoothing = read_f32(r)?;
+    let layer_norm = match read_u8(r)? {
+        0 => false,
+        1 => true,
+        b => bail!("v5 layer_norm flag must be 0 or 1, got {}", b),
+    };
+
+    // Same two-layer vocab-hash defense as v4 (see load_v4 comments).
+    match current_vocab {
+        Some(vocab) => {
+            let prefix_hash = compute_vocab_hash_prefix(vocab, h.saved_vocab_size);
+            if prefix_hash != saved_vocab_hash {
+                bail!(
+                    "vocab mismatch: saved model's first {} vocab tokens (hash {:#x}) \
+                     do not match the current vocab's prefix (hash {:#x}). The output \
+                     layer is row-indexed by vocab position, so loading would silently \
+                     produce garbage. Move {} aside or rebuild the corpus before \
+                     resuming.",
+                    h.saved_vocab_size,
+                    saved_vocab_hash,
+                    prefix_hash,
+                    "model.bin",
+                );
+            }
+        }
+        None => {
+            if saved_vocab_hash != expected.vocab_hash {
+                bail!(
+                    "vocab mismatch: saved hash {:#x} != current hash {:#x}",
+                    saved_vocab_hash,
+                    expected.vocab_hash,
+                );
+            }
+        }
+    }
+
+    let embed_len = h.saved_vocab_size * h.embed_dim;
+    let embed_weights = read_f32_vec(r, embed_len)?;
+    let embed_m = read_f32_vec(r, embed_len)?;
+    let embed_v = read_f32_vec(r, embed_len)?;
+    let mut embedding = Embedding::from_parts_with_adam(
+        h.saved_vocab_size,
+        h.embed_dim,
+        embed_weights,
+        embed_m,
+        embed_v,
+    );
+
+    let layer_count = read_u32(r)? as usize;
+    let mut layers = Vec::with_capacity(layer_count);
+    for i in 0..layer_count {
+        let rows = read_u32(r)? as usize;
+        let cols = read_u32(r)? as usize;
+        let act = activation_from_code(read_u8(r)?)?;
+        let weights = read_f32_vec(r, rows * cols)?;
+        let biases = read_f32_vec(r, rows)?;
+        let w_m = read_f32_vec(r, rows * cols)?;
+        let w_v = read_f32_vec(r, rows * cols)?;
+        let b_m = read_f32_vec(r, rows)?;
+        let b_v = read_f32_vec(r, rows)?;
+        validate_layer_dims(
+            i,
+            layer_count,
+            rows,
+            cols,
+            h.embed_dim,
+            h.context_window,
+            h.saved_vocab_size,
+        )?;
+        let mut layer = Layer::from_parts_with_adam(
+            rows, cols, act, weights, biases, w_m, w_v, b_m, b_v, gpu,
+        )?;
+        if layer_norm && i < layer_count - 1 {
+            layer.ln_gain = read_f32_vec(r, rows)?;
+            layer.ln_bias = read_f32_vec(r, rows)?;
+            layer.ln_gain_m = read_f32_vec(r, rows)?;
+            layer.ln_gain_v = read_f32_vec(r, rows)?;
+            layer.ln_bias_m = read_f32_vec(r, rows)?;
+            layer.ln_bias_v = read_f32_vec(r, rows)?;
+        }
+        layers.push(layer);
+    }
+
+    maybe_extend_vocab(
+        &mut embedding,
+        &mut layers,
+        expected.vocab_size,
+        h.saved_vocab_size,
+        gpu,
+    )?;
+
+    Ok(Network {
+        embedding,
+        layers,
+        vocab_size: expected.vocab_size,
+        hidden_size: h.hidden_size,
+        hidden_layers: h.hidden_layers,
+        embed_dim: h.embed_dim,
+        context_window: h.context_window,
+        adam_step,
+        dropout_p,
+        label_smoothing,
+        layer_norm,
         backprop_scratch: crate::teacher::BackpropScratch::default(),
         profile: crate::neural_network::StepProfile::default(),
     })
@@ -569,7 +739,7 @@ fn load_v4<R: Read>(
 mod tests {
     use super::*;
     use crate::neural_network::{
-        CONTEXT_WINDOW, EMBED_DIM, HIDDEN_SIZE, NUMBER_OF_HIDDEN_LAYERS, network_init,
+        CONTEXT_WINDOW, EMBED_DIM, HIDDEN_SIZE, NUMBER_OF_HIDDEN_LAYERS, Network, network_init,
     };
 
     fn tmp_path(name: &str) -> std::path::PathBuf {
@@ -592,9 +762,11 @@ mod tests {
     }
 
     /// Roundtrip: save a network, load it back, assert every persisted
-    /// field matches exactly. Covers v4 (v3 contents + vocab hash check).
+    /// field matches exactly. Covers the current (v5) format with
+    /// LayerNorm OFF — the v3 contents + vocab hash + the v5
+    /// hyperparameter scalars.
     #[test]
-    fn v4_roundtrip_preserves_weights_biases_and_adam_state() {
+    fn v5_roundtrip_preserves_weights_biases_adam_state_and_hyperparams() {
         let gpu = Gpu::new_cpu();
         // Use full project dims so the tested code path matches production.
         let vocab_n = 17usize;
@@ -611,6 +783,9 @@ mod tests {
         .expect("network_init");
 
         net.adam_step = 12345;
+        // v5 hyperparameter scalars must survive the roundtrip.
+        net.dropout_p = 0.15;
+        net.label_smoothing = 0.05;
         // Sprinkle non-default values into Adam state and embeddings so a
         // load that returns zeroed state would obviously fail.
         net.embedding.weights[0] = 0.125;
@@ -627,8 +802,8 @@ mod tests {
             layer.biases[0] = 0.7 + scale;
         }
 
-        let path = tmp_path("persist_v4_roundtrip");
-        save(&net, &path, vocab_hash).expect("save v4");
+        let path = tmp_path("persist_v5_roundtrip");
+        save(&net, &path, vocab_hash).expect("save v5");
 
         let shape = LoadedShape {
             embed_dim: EMBED_DIM,
@@ -643,6 +818,9 @@ mod tests {
             .expect("file present");
 
         assert_eq!(loaded.adam_step, 12345);
+        assert_eq!(loaded.dropout_p, 0.15);
+        assert_eq!(loaded.label_smoothing, 0.05);
+        assert!(!loaded.layer_norm, "LN was off; must stay off");
         assert_eq!(loaded.embedding.weights, net.embedding.weights);
         assert_eq!(loaded.embedding.m, net.embedding.m);
         assert_eq!(loaded.embedding.v, net.embedding.v);
@@ -656,7 +834,167 @@ mod tests {
             assert_eq!(orig.w_v, got.w_v);
             assert_eq!(orig.b_m, got.b_m);
             assert_eq!(orig.b_v, got.b_v);
+            assert!(got.ln_gain.is_empty(), "no LN params on a non-LN model");
         }
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// v5 with LayerNorm ON: gains/biases + their Adam moments must
+    /// roundtrip exactly, and the loaded network's forward must be
+    /// bit-for-bit identical to the pre-save forward on the same
+    /// input (probabilities compared with exact f32 equality).
+    #[test]
+    fn v5_roundtrip_with_layer_norm_is_bit_exact() {
+        let gpu = Gpu::new_cpu();
+        let (embed_dim, ctx, hidden, hidden_layers, vocab_n) = (4usize, 3usize, 8usize, 2usize, 10usize);
+        let vocab = dummy_vocab(vocab_n);
+        let vocab_hash = compute_vocab_hash(&vocab);
+        let mut net = network_init(&gpu, embed_dim, ctx, hidden, hidden_layers, vocab_n)
+            .expect("network_init");
+        net.enable_layer_norm();
+        net.adam_step = 99;
+        net.dropout_p = 0.2;
+        net.label_smoothing = 0.1;
+        // Move LN parameters and moments off their init values so a
+        // loader that re-initializes them (instead of reading the
+        // file) fails loudly.
+        for layer in net.layers.iter_mut().take(hidden_layers) {
+            layer.ln_gain[0] = 1.25;
+            layer.ln_bias[1] = -0.3;
+            layer.ln_gain_m[2] = 0.011;
+            layer.ln_gain_v[3] = 0.022;
+            layer.ln_bias_m[4] = 0.033;
+            layer.ln_bias_v[5] = 0.044;
+        }
+
+        let window = vec![1usize, 2, 3];
+        let probs_before = net.forward(&gpu, &window, 0).expect("forward before");
+
+        let path = tmp_path("persist_v5_ln_roundtrip");
+        save(&net, &path, vocab_hash).expect("save v5+LN");
+
+        let shape = LoadedShape {
+            embed_dim,
+            context_window: ctx,
+            vocab_size: vocab_n,
+            hidden_size: hidden,
+            hidden_layers,
+            vocab_hash,
+        };
+        let mut loaded = load_with_vocab(&path, &gpu, shape, Some(&vocab))
+            .expect("load")
+            .expect("file present");
+
+        assert!(loaded.layer_norm, "LN flag must persist");
+        assert_eq!(loaded.adam_step, 99);
+        assert_eq!(loaded.dropout_p, 0.2);
+        assert_eq!(loaded.label_smoothing, 0.1);
+        for (orig, got) in net.layers.iter().zip(loaded.layers.iter()) {
+            assert_eq!(orig.ln_gain, got.ln_gain);
+            assert_eq!(orig.ln_bias, got.ln_bias);
+            assert_eq!(orig.ln_gain_m, got.ln_gain_m);
+            assert_eq!(orig.ln_gain_v, got.ln_gain_v);
+            assert_eq!(orig.ln_bias_m, got.ln_bias_m);
+            assert_eq!(orig.ln_bias_v, got.ln_bias_v);
+            assert_eq!(orig.weights, got.weights);
+            assert_eq!(orig.biases, got.biases);
+        }
+        // Output layer must NOT have grown LN params.
+        assert!(loaded.layers.last().unwrap().ln_gain.is_empty());
+
+        let probs_after = loaded.forward(&gpu, &window, 0).expect("forward after");
+        assert_eq!(probs_before, probs_after, "forward must be bit-for-bit identical");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Byte-format writer for v4 files, mirroring what `save()`
+    /// produced before the v5 format landed. Used to prove that
+    /// existing on-disk v4 checkpoints (including the LIVE production
+    /// model.bin) still load and forward identically.
+    fn write_v4_file(net: &Network, path: &std::path::Path, vocab_hash: u64) {
+        let mut buf: Vec<u8> = Vec::new();
+        write_u32(&mut buf, MAGIC).unwrap();
+        write_u32(&mut buf, VERSION_V4).unwrap();
+        write_u32(&mut buf, net.embed_dim as u32).unwrap();
+        write_u32(&mut buf, net.context_window as u32).unwrap();
+        write_u32(&mut buf, net.vocab_size as u32).unwrap();
+        write_u32(&mut buf, net.hidden_size as u32).unwrap();
+        write_u32(&mut buf, net.hidden_layers as u32).unwrap();
+        write_u64(&mut buf, net.adam_step).unwrap();
+        write_u64(&mut buf, vocab_hash).unwrap();
+        write_f32_slice(&mut buf, &net.embedding.weights).unwrap();
+        write_f32_slice(&mut buf, &net.embedding.m).unwrap();
+        write_f32_slice(&mut buf, &net.embedding.v).unwrap();
+        write_u32(&mut buf, net.layers.len() as u32).unwrap();
+        for layer in &net.layers {
+            write_u32(&mut buf, layer.rows as u32).unwrap();
+            write_u32(&mut buf, layer.cols as u32).unwrap();
+            write_u8(&mut buf, activation_code(layer.activation)).unwrap();
+            write_f32_slice(&mut buf, &layer.weights).unwrap();
+            write_f32_slice(&mut buf, &layer.biases).unwrap();
+            write_f32_slice(&mut buf, &layer.w_m).unwrap();
+            write_f32_slice(&mut buf, &layer.w_v).unwrap();
+            write_f32_slice(&mut buf, &layer.b_m).unwrap();
+            write_f32_slice(&mut buf, &layer.b_v).unwrap();
+        }
+        std::fs::write(path, &buf).expect("write v4 file");
+    }
+
+    /// The LIVE production model is a v4 file: it must keep loading
+    /// with today's semantics (dropout/label-smoothing 0, LayerNorm
+    /// OFF) and forward bit-for-bit identically to the network it was
+    /// saved from.
+    #[test]
+    fn v4_files_still_load_with_defaults_and_identical_forward() {
+        let gpu = Gpu::new_cpu();
+        let (embed_dim, ctx, hidden, hidden_layers, vocab_n) = (4usize, 3usize, 8usize, 2usize, 10usize);
+        let vocab = dummy_vocab(vocab_n);
+        let vocab_hash = compute_vocab_hash(&vocab);
+        let mut net = network_init(&gpu, embed_dim, ctx, hidden, hidden_layers, vocab_n)
+            .expect("network_init");
+        net.adam_step = 4242;
+        net.layers[0].w_m[3] = 0.5;
+        net.embedding.m[0] = 0.25;
+
+        let window = vec![1usize, 4, 7];
+        let probs_before = net.forward(&gpu, &window, 2).expect("forward before");
+
+        let path = tmp_path("persist_v4_compat");
+        write_v4_file(&net, &path, vocab_hash);
+
+        let shape = LoadedShape {
+            embed_dim,
+            context_window: ctx,
+            vocab_size: vocab_n,
+            hidden_size: hidden,
+            hidden_layers,
+            vocab_hash,
+        };
+        let mut loaded = load_with_vocab(&path, &gpu, shape, Some(&vocab))
+            .expect("v4 load")
+            .expect("file present");
+
+        assert_eq!(loaded.adam_step, 4242);
+        assert_eq!(loaded.dropout_p, 0.0, "v4 has no dropout_p; must default to 0");
+        assert_eq!(loaded.label_smoothing, 0.0);
+        assert!(!loaded.layer_norm, "v4 predates LN; must load with LN off");
+        assert_eq!(loaded.embedding.weights, net.embedding.weights);
+        assert_eq!(loaded.embedding.m, net.embedding.m);
+        for (orig, got) in net.layers.iter().zip(loaded.layers.iter()) {
+            assert_eq!(orig.weights, got.weights);
+            assert_eq!(orig.biases, got.biases);
+            assert_eq!(orig.w_m, got.w_m);
+            assert_eq!(orig.w_v, got.w_v);
+            assert!(got.ln_gain.is_empty());
+        }
+
+        let probs_after = loaded.forward(&gpu, &window, 2).expect("forward after");
+        assert_eq!(
+            probs_before, probs_after,
+            "v4 load must forward bit-for-bit identically"
+        );
 
         let _ = std::fs::remove_file(&path);
     }

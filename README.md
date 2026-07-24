@@ -23,7 +23,7 @@ is available as an opt-in for experiments.
 - `src/embeddings/mod.rs` — trainable word embedding table (with Adam state)
 - `src/neural_network.rs` — model, forward, generation, training loop
 - `src/teacher.rs` — softmax + cross-entropy backprop (incl. input gradient for embeddings)
-- `src/persist.rs` — save/load `model.bin` (v3: weights, biases, Adam moments, `adam_step`)
+- `src/persist.rs` — save/load `model.bin` (v5: weights, biases, Adam moments, `adam_step`, vocab hash, hyperparams, optional LayerNorm)
 - `src/gpu.rs` — Vulkan/CPU backend dispatch
 - `src/machine_learning.rs` — section-similarity + embedding-cosine teacher lookup
 - `src/rag.rs` — embedding-cosine retrieval store, used by `serve`
@@ -32,6 +32,10 @@ is available as an opt-in for experiments.
 - `data/dialogs.bin` — ignored bincode cache of the parsed corpus (auto-invalidated on edit)
 - `vocab.txt` — derived vocabulary (regenerated from corpus on every run)
 - `model.bin` — saved embeddings + weights + biases + Adam state (created on first run)
+- `model.serving.bin` + `data/dialogs.serving.txt` — pinned pair the live server reads (see `scripts/promote_model.sh`)
+- `scripts/refresh_corpus.sh` — weekly incremental Discord→corpus refresh (systemd timer)
+- `scripts/rebuild_full_corpus.sh` — full corpus rebuild from raw sources
+- `scripts/promote_model.sh` — promote trained model + corpus snapshot to serving
 
 ## Build
 
@@ -55,6 +59,12 @@ Produces in `target/release/`:
 First run with no `model.bin` initializes a fresh network, runs a short
 pretraining pass over `data/dialogs.txt`, saves `model.bin`, then drops
 you into the prompt. Subsequent runs load the saved weights instantly.
+
+> `data/dialogs.txt` and `vocab.txt` are **not tracked in git** — they are
+> derived artifacts, mutated weekly by the automated refresh. On a fresh
+> clone, bootstrap the corpus with
+> `scripts/rebuild_full_corpus.sh [oasst.jsonl.gz]` (the scraped Discord
+> TSVs live under `data/discord/`, also untracked) before training.
 
 Commands inside the chat:
 
@@ -149,17 +159,37 @@ Endpoints:
 - `GET /healthz` → `200 ok` (unauthenticated; readiness probe)
 - `POST /chat` → `{"reply":"..."}` with `X-API-Key` header
 
-POST body schema: `{"channel_id":"...","user":"...","input":"..."}`.
+POST body schema (all values strings; only `input` is required, unknown
+fields are ignored so older clients keep working):
 
-The server holds the model in memory and serializes requests behind a
-`Mutex<Network>` (the per-layer caches are mutable per request). It
+```json
+{"channel_id":"...","user":"...","user_id":"...","user_is_bot":"true|false",
+ "input":"...",
+ "reply_to_user":"...","reply_to_user_id":"...","reply_to_text":"...",
+ "reply_to_is_bot":"true|false","reply_to_is_self":"true|false"}
+```
+
+The server maps each channel's speakers onto PERSON_N tags (the bot is
+always PERSON_0; `reply_to_is_self` marks the replied-to message as the
+bot's own) and feeds the model *tagged* turns — the same shape as the
+training corpus. A `reply_to_*` context turn is injected directly
+before the input so it survives the 32-token window truncation.
+
+The server holds the model in memory and serializes generation behind a
+`Mutex<Network>` (the per-layer caches are mutable per request); a small
+accept pool keeps `/healthz` responsive while a request generates. It
 also indexes the corpus into a RAG store at startup and prepends the
 top-K most embedding-similar past turns to the per-channel chat memory
 before generating each reply.
 
-The server only reads `model.bin` at startup. Restart it after replacing
-the model. For a minimal systemd deployment and the Discord bot connection
-settings, see [Discord AI server setup](docs/discord-ai-setup.md).
+The server only reads the model at startup. In production it reads a
+**pinned pair** — `model.serving.bin` + `data/dialogs.serving.txt` —
+promoted together by `scripts/promote_model.sh`, so the weekly corpus
+refresh can never drift the vocab out from under the live model (the
+v4+ vocab hash would refuse to load). A `sighurt-llm.path` watcher
+restarts the service when a promotion lands. For the full single-machine
+deployment (bot + server + timers), see
+[Discord AI setup](docs/discord-ai-setup.md).
 
 Env vars:
 
@@ -167,7 +197,10 @@ Env vars:
 |---|---|---|
 | `SIGHURT_BIND` | `127.0.0.1:8088` | listen address |
 | `SIGHURT_API_KEY` | (required) | refuses to start without one, requires ≥ 16 chars |
-| `SIGHURT_MODEL` | `model.bin` | model file to load |
+| `SIGHURT_MODEL` | `model.bin` | model file to load; **missing model = startup error** (`SIGHURT_ALLOW_FRESH=1` overrides, for testing) |
+| `SIGHURT_CORPUS` | `data/dialogs.txt` | corpus for vocab + RAG; must match the model's training snapshot |
+| `SIGHURT_TEMPERATURE` | `1.0` | sampling temperature |
+| `SIGHURT_TOP_P` | (unset) | nucleus sampling mass; unset keeps top-k 5 |
 
 ## Tweaking the model
 
@@ -206,21 +239,25 @@ Online-chat hyperparameters live in `src/main.rs`:
 ## On-disk model format (`model.bin`)
 
 Binary, little-endian. Header: magic `0x4D4F_444C` ("MODL"), `u32`
-version. Two versions exist:
+version. Versions:
 
 - **v2** — weights + biases only. Adam moments are recreated as zeros
-  on load, so a resumed run pays a bias-correction "warmup tax" on the
-  first batch of steps, which in practice means epoch 1 after restart
-  is a small regression before things stabilize.
-- **v3** (current) — adds the AdamW moment buffers (`w_m`, `w_v`,
-  `b_m`, `b_v` per layer, plus the embedding's `m`, `v`) and the global
-  `adam_step` counter. A resumed run picks up Adam exactly where it
-  left off, so restarting mid-training is no longer destructive.
+  on load, so a resumed run pays a bias-correction "warmup tax".
+- **v3** — adds the AdamW moment buffers (`w_m`, `w_v`, `b_m`, `b_v`
+  per layer, plus the embedding's `m`, `v`) and the global `adam_step`
+  counter. A resumed run picks up Adam exactly where it left off.
   Files are ~3× larger than v2 because of the moment arrays.
+- **v4** — adds a hash of the vocab the model was trained against.
+  Loading refuses on mismatch instead of silently scrambling the
+  output-row-to-word mapping after a corpus/vocab change. Append-only
+  vocab growth stays allowed (the hash covers the saved-size prefix).
+- **v5** (current) — persists the training hyperparameters
+  (`dropout_p`, `label_smoothing`) and optional per-layer LayerNorm
+  parameters (gain/bias + Adam state). Old files load with those
+  features off, exactly as before.
 
-`save()` always writes v3. `load()` accepts either; v2 files come back
-with zeroed moments (preserving the old behavior) and become v3 the next
-time the trainer saves.
+`save()` always writes the current version; `load()` accepts all of
+the above.
 
 ## Adding training data
 
@@ -252,7 +289,30 @@ automatically. Any new tokens appended to the corpus get added to
 table and the output layer (the loader extends them in place rather
 than discarding the model).
 
-### Recommended workflow after editing the corpus
+### The Discord pipeline (the normal way data arrives)
+
+The Discord bot (`~/discord-bot`, separate repo) logs every message in
+every server it's in — humans *and* other bots — to per-channel TSVs
+with reply-to ids, and heals offline gaps with a daily catch-up scrape.
+From there:
+
+- **Weekly (automated)**: `scripts/refresh_corpus.sh` (run by the
+  `sighurt-refresh` systemd user timer, Sun 04:37) rsyncs the TSVs into
+  `data/discord/` and runs `convert_discord` **incrementally** — per-
+  channel cursors in `data/discord/.convert-state.json` mean only new
+  messages become new sections — then `clean_corpus` + `rebuild_vocab`.
+- **Full rebuild**: `scripts/rebuild_full_corpus.sh data/oasst1.trees.jsonl.gz`
+  reconverts ALL Discord history (use after converter-rule changes),
+  re-ingests OASST, injects seed pairs ×3, cleans, rebuilds vocab.
+  Train fresh afterwards — the vocab order will have changed.
+
+`convert_discord` is reply-aware: reply chains are stitched into their
+own `<SEC>` sections in time order (a threaded exchange scattered
+through an hour of channel noise becomes one clean dialog), and
+`<@id>` mentions are rewritten to learnable `@displayname` tokens
+(the live bot resolves `@name` in model output back into real pings).
+
+### Recommended workflow after editing the corpus by hand
 
 1. Ingest / edit `data/dialogs.txt` (e.g. `convert_discord`, `inject_seed`,
    or a hand edit).
@@ -265,19 +325,12 @@ than discarding the model).
    (`cp data/dialogs.txt data/dialogs.txt.pre-clean`).
 3. Run `cargo run --release --bin rebuild_vocab` so `vocab.txt`
    reflects the cleaned corpus.
-4. **Decide what to do with `model.bin`** — see the warning below. If
-   the vocab order changed (likely whenever long-tail frequencies
-   shift), move the old `model.bin` aside so the trainer fresh-inits.
-
-> **Vocab-reorder footgun**: `vocab.txt` is ordered by frequency. When
-> the corpus changes, common tokens stay near the head but the
-> long-tail order can shuffle, even if the line count stays the same.
-> `persist::load` only checks vocab SIZE — if the order moved, the
-> saved `model.bin` loads silently with the wrong row-to-word
-> mapping in the output layer (garbage outputs, NaN-free, no error).
-> Workaround: `mv model.bin model.bin.stale-vocab-order` after a
-> cleanup pass and let the trainer fresh-init. A proper fix would
-> hash the vocab into `model.bin` and bail on mismatch.
+4. **Decide what to do with `model.bin`**: if the vocab order changed
+   (likely whenever long-tail frequencies shift), the v4+ vocab hash
+   makes the loader refuse the old model — move it aside and train
+   fresh. The live server is immune: it reads the pinned
+   `data/dialogs.serving.txt` snapshot, not the corpus you just edited
+   (see `scripts/promote_model.sh`).
 
 ## Resetting the model
 
