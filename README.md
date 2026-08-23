@@ -137,8 +137,8 @@ Production transformer settings live in `~/.config/sighurt-llm.env`:
 SIGHURT_MODEL=/home/gusahlg/artificial-stupidity/model.serving.f16.gguf
 SIGHURT_TOKENIZER=/home/gusahlg/artificial-stupidity/tokenizer.serving.json
 SIGHURT_CONTEXT_TOKENS=2048
-SIGHURT_MAX_NEW_TOKENS=64
-SIGHURT_REQUEST_TIMEOUT=75
+SIGHURT_MAX_NEW_TOKENS=160
+SIGHURT_REQUEST_TIMEOUT=90
 SIGHURT_TEMPERATURE=0.75
 SIGHURT_TOP_P=0.92
 SIGHURT_TOP_K=50
