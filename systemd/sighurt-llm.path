@@ -1,0 +1,11 @@
+[Unit]
+Description=Watch the promoted transformer model and restart SuperSighurt
+
+[Path]
+# promote_llama_model writes the tokenizer first and atomically renames the
+# model last, so this event always observes a consistent pair.
+PathChanged=%h/artificial-stupidity/model.serving.f16.gguf
+Unit=sighurt-llm-reload.service
+
+[Install]
+WantedBy=default.target

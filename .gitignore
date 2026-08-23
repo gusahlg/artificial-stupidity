@@ -12,6 +12,10 @@
 /data/dialogs.bin
 /data/dialogs.bin.tmp
 /data/dialogs.txt.tmp
+/data/dialogs.discord.raw.txt
+/data/dialogs.discord.txt
+/data/dialogs.discord.raw.txt.tmp
+/data/dialogs.discord.txt.tmp
 
 # Tooling / staging
 /.pi-stage/
@@ -25,6 +29,10 @@
 # scripts/promote_model.sh — machine-local, never committed.
 /model.serving.bin
 /model.serving.bin.tmp
+/model.serving.f16.gguf
+/model.serving.f16.gguf.*
+/tokenizer.serving.json
+/tokenizer.serving.json.*
 /data/dialogs.serving.txt
 /data/dialogs.serving.txt.tmp
 /data/dialogs.serving.bin
@@ -33,6 +41,9 @@
 /training.log
 /training-*.log
 /training-*.log.*
+/training/data/
+/training/outputs/
+**/__pycache__/
 
 # The corpus and its derived vocab are now MUTATED weekly by the automated
 # refresh (scripts/refresh_corpus.sh) and rebuilt from the raw TSVs/OASST by

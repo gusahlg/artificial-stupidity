@@ -1,18 +1,29 @@
-# artificial-stupidity
+# artificial-stupidity / SuperSighurt
 
-A tiny from-scratch neural language model written in Rust. Embedding table
-+ a few tanh-MLP layers + cross-entropy softmax output, trained with
-AdamW. Has an interactive REPL, a standalone trainer, and an HTTP server
-that exposes inference over the network (driven by a separate Discord
-bot, not in this repo). The math runs on the CPU by default; a Vulkan
-GEMM backend (via the sibling `tensor-ash` crate at `../tensor-ash`)
-is available as an opt-in for experiments.
+SuperSighurt is a Discord-focused 1.1B-parameter Llama transformer. It is
+continued from an immutable TinyLlama 1.1B Chat v1.0 lineage on the complete
+cleaned Discord archive, test-scored code examples, attributed encyclopedia and
+web-grounding examples, curated Sig personality demonstrations, and a pinned
+general-conversation replay set, then
+served as an f16 GGUF by the Rust/Vulkan `tensor-ash` runtime. The runtime is
+pinned to tensor-ash commit `57bbf3884daf8e483650fdace37144021b17b93d`
+(v2.0.0) so builds do not silently change underneath a trained artifact.
+
+The original small, from-scratch tanh-MLP remains in the repository as a
+legacy research implementation and rollback target. Production uses
+`serve_llama`, not `serve`.
+
+The transformer is roughly 100 times larger than the roughly 11M-parameter legacy
+network. Its approximately 2.2 GB f16 GGUF also leaves safe headroom on the
+production server's 4 GB GTX 1650; a larger unquantized family would not fit the
+current tensor-ash deployment path.
 
 ## Layout
 
 - `src/main.rs` — interactive chat REPL (`rust_fun` binary)
 - `src/bin/train.rs` — standalone auto-trainer (`train` binary)
-- `src/bin/serve.rs` — HTTP server for inference (`serve` binary)
+- `src/bin/serve.rs` — legacy MLP HTTP server (`serve` binary)
+- `src/bin/serve_llama.rs` — production TinyLlama GGUF server through tensor-ash
 - `src/bin/convert_discord.rs` — ingest a Discord export into the dialog format
 - `src/bin/ingest_dailydialog.rs` / `ingest_tinystories.rs` — corpus loaders
 - `src/bin/inject_seed.rs` — splice a fixed set of "seed" Q/A pairs into the corpus
@@ -36,6 +47,19 @@ is available as an opt-in for experiments.
 - `scripts/refresh_corpus.sh` — weekly incremental Discord→corpus refresh (systemd timer)
 - `scripts/rebuild_full_corpus.sh` — full corpus rebuild from raw sources
 - `scripts/promote_model.sh` — promote trained model + corpus snapshot to serving
+- `training/export_sft.py` — leakage-safe canonical-corpus → chat SFT export
+- `training/generate_persona.py` — write the reviewed 140-example Sig personality/context set
+- `training/build_auxiliary_data.py` — build pinned code/wiki/web/personality splits
+- `training/preflight.py` — fail-fast paid-GPU/data/revision/CUDA checks
+- `training/train_llama.py` — full-parameter bf16 SFT with replay and quality gates
+- `training/evaluate_sampling.py` — compare safe variation settings on the final HF model
+- `training/conversation_acceptance.py` — 26-turn live-endpoint conversation suite (ollama plays the human)
+- `training/make_repair_data.py` — author the curated sig-v2.1 behavior-repair demonstrations
+- `training/run_on_runpod.sh` — reproducible Runpod preflight, training, and conversion
+- `training/convert_to_gguf.sh` — pinned llama.cpp f16 GGUF conversion
+- `scripts/promote_llama_model.sh` — hash-check, real-generation check, atomic promotion
+- `scripts/apply_recommended_sampling.sh` — apply the evaluate_sampling winner to the live env
+- `scripts/watchdog_probe.sh` + `systemd/sighurt-llm-watchdog.*` — restart serving when GPU-context loss bricks generation
 
 ## Build
 
@@ -47,8 +71,104 @@ Produces in `target/release/`:
 
 - `rust_fun` — interactive chat REPL
 - `train`    — auto-trainer
-- `serve`    — HTTP inference server
+- `serve`    — legacy MLP HTTP inference server
+- `serve_llama` — production tensor-ash transformer HTTP server
 - assorted corpus ingestors / utility binaries
+
+## Transformer training and promotion
+
+Rebuild and export the complete corpus before renting a GPU:
+
+```sh
+nix develop -c scripts/rebuild_full_corpus.sh
+nix develop -c python3 training/export_sft.py
+python3 training/generate_persona.py
+# Run in a Python environment containing Hugging Face datasets:
+python3 training/build_auxiliary_data.py
+PYTHONPATH=training python3 -m unittest \
+  training/test_export_sft.py training/test_build_data.py \
+  training/test_verify_artifact.py training/test_train_loss.py
+```
+
+The export hashes whole conversation sections into one deterministic split, so
+different targets from the same Discord thread cannot leak into validation.
+When a section contains bot turns, only `PERSON_0` is used as the assistant
+target; human-only sections contribute next-speaker examples. IDs are not
+exported. Serving and training intentionally use the same structured,
+oldest-first context representation.
+
+`training/run_on_runpod.sh` installs exact dependency versions, runs the full
+preflight (including a real bf16 forward/backward/fused-Adam step), performs
+full-parameter continuation training, compares held-out loss separately for
+Discord, general chat, code, personality, encyclopedia, and web grounding, and
+only then emits an f16 GGUF. Semantic, context, prompt-injection, and diversity
+gates run as well. Completion loss is averaged within each example before the
+example losses are averaged, so long code answers cannot outweigh the verified
+70% Discord example share. A failed quality
+gate exits before conversion. Checkpoints are retained on the attached network
+volume and may be resumed with `--resume-from-checkpoint`.
+
+Before promotion, compare conservative, balanced, and playful sampling on the
+finished GPU model:
+
+```sh
+python3 training/evaluate_sampling.py \
+  --model /workspace/outputs/super-sighurt-sig-v2-20260822/final-hf \
+  --output /workspace/outputs/super-sighurt-sig-v2-20260822/sampling-evaluation.json
+```
+
+Promote only the resulting artifact directory:
+
+```sh
+scripts/promote_llama_model.sh \
+  /path/to/output/artifact \
+  ada45f66f1955a727aa854a8c2b79db5064500908a06c860f7079897eb728efe
+```
+
+Promotion verifies `SHA256SUMS`, pinned data/model provenance, loss gates, and
+semantic probes against the externally supplied parent-model SHA-256; it then
+loads the complete model on the deployment GPU and runs real generation. It
+preserves one previous generation and renames the tokenizer before the watched
+model file, so the live service never sees a new model with an old tokenizer.
+
+Production transformer settings live in `~/.config/sighurt-llm.env`:
+
+```ini
+SIGHURT_MODEL=/home/gusahlg/artificial-stupidity/model.serving.f16.gguf
+SIGHURT_TOKENIZER=/home/gusahlg/artificial-stupidity/tokenizer.serving.json
+SIGHURT_CONTEXT_TOKENS=2048
+SIGHURT_MAX_NEW_TOKENS=64
+SIGHURT_REQUEST_TIMEOUT=75
+SIGHURT_TEMPERATURE=0.75
+SIGHURT_TOP_P=0.92
+SIGHURT_TOP_K=50
+SIGHURT_REPETITION_PENALTY=1.15
+ML_DEVICE=discrete
+```
+
+Never deploy greedy decoding (`SIGHURT_TEMPERATURE=0`, `SIGHURT_TOP_K=1`).
+Discord feeds the bot's own replies back as context, so a deterministic
+sampler that emits one generic line will see that line in-context on the next
+turn and reproduce it forever — a self-reinforcing repetition spiral (observed
+live: 92% byte-identical replies across 26-turn conversations). The sampler
+applies the repetition penalty over the prompt tail plus the generated tokens
+(the Hugging Face semantics used by training-time evaluations), which is what
+lets the bot escape a channel history already poisoned with repeats.
+`scripts/apply_recommended_sampling.sh` applies the winner from
+`training/evaluate_sampling.py` to the env file.
+
+Long-conversation quality is measured end-to-end with
+`training/conversation_acceptance.py`, which drives the live `/chat` endpoint
+through 26-turn conversations on 17 scenarios (a local ollama model plays the
+human) and reports duplicate-reply, persona-leak, and reliability metrics per
+transcript.
+
+On an existing installation, `scripts/configure_llama_env.sh` performs this
+switch atomically while preserving the current API key and unrelated settings.
+`scripts/run_serve_llama.sh` supplies the Vulkan loader and NVK/RADV ICDs from
+the GC-rooted `~/.local/state/nix/profiles/sighurt-vulkan` profile, then selects
+the discrete GPU. This keeps headless deployments reproducible even before the
+same graphics packages are activated system-wide by a NixOS rebuild.
 
 ## Chat with the bot
 
@@ -190,6 +310,14 @@ v4+ vocab hash would refuse to load). A `sighurt-llm.path` watcher
 restarts the service when a promotion lands. For the full single-machine
 deployment (bot + server + timers), see
 [Discord AI setup](docs/discord-ai-setup.md).
+
+The NVK/GTX 1650 Vulkan stack can lose the logical device under sustained
+load. The server process survives that loss — `/healthz` still answers — but
+every generation fails until the GPU context is recreated, which
+`Restart=always` never notices. `systemd/sighurt-llm-watchdog.timer` runs
+`scripts/watchdog_probe.sh` every two minutes: it exercises a real `/chat`
+generation and restarts the service only on the consistent-failure signature
+(a queue-full 503 or timeout counts as alive).
 
 Env vars:
 

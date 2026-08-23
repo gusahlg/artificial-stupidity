@@ -1,5 +1,5 @@
 {
-  description = "artificial-stupidity: tiny from-scratch language model on top of tensor-ash's Vulkan GEMM";
+  description = "SuperSighurt: Discord-focused transformer inference with tensor-ash, plus the legacy from-scratch model";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";

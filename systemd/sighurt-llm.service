@@ -1,0 +1,19 @@
+[Unit]
+Description=SuperSighurt tensor-ash transformer HTTP server
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+WorkingDirectory=%h/artificial-stupidity
+ExecStart=%h/artificial-stupidity/scripts/run_serve_llama.sh
+EnvironmentFile=%h/.config/sighurt-llm.env
+Restart=always
+RestartSec=5
+RestartSteps=6
+RestartMaxDelaySec=300
+TimeoutStartSec=180
+
+[Install]
+WantedBy=default.target

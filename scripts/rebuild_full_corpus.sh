@@ -6,11 +6,12 @@
 #
 # Build order matters (convert_discord --full TRUNCATES dialogs.txt):
 #   1. convert_discord --full   — every scraped Discord message
-#   2. ingest_oasst             — OpenAssistant trees (needs the dump; see below)
-#   3. inject_seed x3           — hand-curated persona pairs; x3 because
+#   2. snapshot + clean Discord — preserves a Discord-only, auditable corpus
+#   3. ingest_oasst             — OpenAssistant trees (needs the dump; see below)
+#   4. inject_seed x3           — hand-curated persona pairs; x3 because
 #                                 clean_corpus rule 7 dedup-caps at 3
-#   4. clean_corpus             — the 14 cleaning rules + shuffle
-#   5. rebuild_vocab
+#   5. clean_corpus             — the 14 cleaning rules + shuffle
+#   6. rebuild_vocab
 #
 # OASST dump: pass the path as $1 or set OASST_JSONL. Download with:
 #   curl -LO https://huggingface.co/datasets/OpenAssistant/oasst1/resolve/main/2023-04-12_oasst_ready.trees.jsonl.gz
@@ -35,6 +36,15 @@ for tool in convert_discord inject_seed clean_corpus rebuild_vocab; do
     fi
 done
 
+# Fail before syncing or truncating anything. On NixOS, python3 may only be
+# present inside `nix develop`; discovering that after `convert_discord --full`
+# leaves a valid but incomplete Discord-only corpus.
+if [ -n "$OASST_JSONL" ] && [ -f "$OASST_JSONL" ] && ! command -v python3 >/dev/null; then
+    echo "rebuild_full_corpus: python3 is required for OASST ingestion" >&2
+    echo "Run: nix develop -c scripts/rebuild_full_corpus.sh '$OASST_JSONL'" >&2
+    exit 1
+fi
+
 if [ -d "$BOT_DATA" ]; then
     echo "rebuild_full_corpus: syncing TSVs from $BOT_DATA"
     mkdir -p data/discord
@@ -44,12 +54,25 @@ else
 fi
 
 if [ -f data/dialogs.txt ]; then
-    stamp=$(date +%Y-%m-%d)
-    cp data/dialogs.txt "data/dialogs.txt.pre-rebuild-$stamp"
-    echo "rebuild_full_corpus: previous corpus kept at data/dialogs.txt.pre-rebuild-$stamp"
+    stamp=$(date -u +%Y%m%dT%H%M%SZ)
+    backup="data/dialogs.txt.pre-rebuild-$stamp"
+    if [ -e "$backup" ]; then
+        backup="$backup.$$"
+    fi
+    cp data/dialogs.txt "$backup"
+    echo "rebuild_full_corpus: previous corpus kept at $backup"
 fi
 
 "$BIN/convert_discord" --full
+
+# Freeze the Discord-only stage before assistant corpora are appended.  The
+# modern transformer trainer consumes this file directly so it can enforce a
+# measured Discord share; using the merged dialogs.txt made that impossible to
+# prove because source labels are intentionally absent from the canonical
+# PERSON_N format.  Keep the raw snapshot too so cleaner changes are auditable.
+cp data/dialogs.txt data/dialogs.discord.raw.txt
+"$BIN/clean_corpus" data/dialogs.discord.raw.txt data/dialogs.discord.txt
+echo "rebuild_full_corpus: wrote cleaned Discord-only corpus data/dialogs.discord.txt"
 
 if [ -n "$OASST_JSONL" ] && [ -f "$OASST_JSONL" ]; then
     echo "rebuild_full_corpus: ingesting OASST from $OASST_JSONL"
@@ -66,6 +89,7 @@ done
 "$BIN/rebuild_vocab"
 
 echo "rebuild_full_corpus: done. Corpus stats:"
+grep -c '^<SEC>' data/dialogs.discord.txt | sed 's/^/  Discord-only sections: /'
 grep -c '^<SEC>' data/dialogs.txt | sed 's/^/  sections: /'
 wc -l < vocab.txt | sed 's/^/  vocab tokens: /'
 echo "rebuild_full_corpus: NOTE vocab order changed — train a fresh model before promoting."

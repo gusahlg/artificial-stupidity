@@ -355,66 +355,54 @@ fn save_state(path: &Path, state: &ConvertState) -> Result<()> {
     Ok(())
 }
 
-/// Group messages by transitive reply links. Returns each qualifying chain
-/// (>=2 messages, >=2 distinct authors) sorted by message id. Reply targets
-/// missing from the TSV (deleted messages, pre-scrape history) simply
-/// terminate their chain.
+/// Extract one root-to-leaf path for each reply branch. Each returned path has
+/// >=2 messages and >=2 distinct authors. Reply targets missing from the TSV
+/// (deleted messages, pre-scrape history) simply terminate their path.
 fn extract_reply_chains(messages: &[Msg]) -> Vec<Vec<Msg>> {
     let by_id: HashMap<u64, &Msg> = messages.iter().map(|m| (m.id, m)).collect();
-    // Path-compressed walk to each message's chain root.
-    let mut root_of: HashMap<u64, u64> = HashMap::new();
-    for m in messages {
-        let mut path = vec![m.id];
-        let mut cur = m;
-        let root = loop {
-            match cur.reply_to.and_then(|t| by_id.get(&t)) {
-                Some(target) => {
-                    if let Some(&r) = root_of.get(&target.id) {
-                        break r;
-                    }
-                    if path.contains(&target.id) {
-                        break target.id; // defensive: reply cycles can't
-                        // normally happen (a reply always targets an older
-                        // id) but corrupt data shouldn't hang us.
-                    }
-                    path.push(target.id);
-                    cur = target;
-                }
-                None => break cur.id,
+
+    // A reply component is a tree. Flattening the whole component by time
+    // fabricates adjacency between sibling replies. Shared ancestors are
+    // intentionally repeated so every emitted turn follows its actual edge.
+    let parent_ids: HashSet<u64> = messages
+        .iter()
+        .filter_map(|m| m.reply_to.filter(|id| by_id.contains_key(id)))
+        .collect();
+    let mut leaves: Vec<&Msg> = messages
+        .iter()
+        .filter(|m| {
+            let has_known_parent = m.reply_to.is_some_and(|id| by_id.contains_key(&id));
+            has_known_parent && !parent_ids.contains(&m.id)
+        })
+        .collect();
+    leaves.sort_by_key(|m| m.id);
+
+    let mut chains = Vec::new();
+    for leaf in leaves {
+        let mut reversed = Vec::new();
+        let mut seen = HashSet::new();
+        let mut current = Some(leaf);
+        while let Some(message) = current {
+            // Valid replies point backward, but corrupt input must not loop.
+            if !seen.insert(message.id) {
+                break;
             }
-        };
-        for id in path {
-            root_of.insert(id, root);
+            reversed.push(message.clone());
+            current = message.reply_to.and_then(|id| by_id.get(&id).copied());
+        }
+        reversed.reverse();
+        if reversed.len() >= 2
+            && reversed
+                .iter()
+                .map(|m| m.author_id)
+                .collect::<HashSet<_>>()
+                .len()
+                >= 2
+        {
+            chains.push(reversed);
         }
     }
-    let reply_targets: HashSet<u64> = messages.iter().filter_map(|m| m.reply_to).collect();
-    let mut groups: BTreeMap<u64, Vec<Msg>> = BTreeMap::new();
-    for m in messages {
-        let root = root_of.get(&m.id).copied().unwrap_or(m.id);
-        // Only messages that participate in at least one reply edge count;
-        // a lone message is its own root but not a chain.
-        let is_linked =
-            m.reply_to.map(|t| by_id.contains_key(&t)).unwrap_or(false) || reply_targets.contains(&m.id);
-        if is_linked {
-            groups.entry(root).or_default().push(m.clone());
-        }
-    }
-    groups
-        .into_values()
-        .filter(|chain| {
-            chain.len() >= 2
-                && chain
-                    .iter()
-                    .map(|m| m.author_id)
-                    .collect::<HashSet<_>>()
-                    .len()
-                    >= 2
-        })
-        .map(|mut chain| {
-            chain.sort_by_key(|m| m.id);
-            chain
-        })
-        .collect()
+    chains
 }
 
 /// Build the emitted turn list for one section: per-section PERSON_N
@@ -1111,15 +1099,32 @@ mod tests {
     }
 
     #[test]
-    fn forked_replies_group_into_one_chain() {
-        // Two people reply to the same root — one conversation component.
+    fn forked_replies_become_separate_paths() {
+        // Sibling replies are separate conversations, not sequential turns.
         let msgs = vec![
             mk(1, 100, "hot take"),
             mk_reply(2, 200, "disagree", 1),
             mk_reply(3, 300, "agree", 1),
         ];
         let chains = extract_reply_chains(&msgs);
-        assert_eq!(chains.len(), 1);
-        assert_eq!(chains[0].len(), 3);
+        assert_eq!(chains.len(), 2);
+        assert_eq!(chains[0].iter().map(|m| m.id).collect::<Vec<_>>(), vec![1, 2]);
+        assert_eq!(chains[1].iter().map(|m| m.id).collect::<Vec<_>>(), vec![1, 3]);
+    }
+
+    #[test]
+    fn nested_fork_preserves_each_reply_ancestry() {
+        // A chronological flatten would fabricate 2 -> 3 -> 4, although 4
+        // explicitly replies to 2.
+        let msgs = vec![
+            mk(1, 100, "root"),
+            mk_reply(2, 200, "branch a", 1),
+            mk_reply(3, 300, "branch b", 1),
+            mk_reply(4, 100, "follow a", 2),
+        ];
+        let chains = extract_reply_chains(&msgs);
+        assert_eq!(chains.len(), 2);
+        assert_eq!(chains[0].iter().map(|m| m.id).collect::<Vec<_>>(), vec![1, 3]);
+        assert_eq!(chains[1].iter().map(|m| m.id).collect::<Vec<_>>(), vec![1, 2, 4]);
     }
 }

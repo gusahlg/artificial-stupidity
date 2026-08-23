@@ -1,0 +1,9 @@
+# The Runpod PyTorch image supplies CUDA-enabled torch. These exact versions
+# are exercised before a paid training run; all resolved versions are recorded
+# in training-manifest.json.
+transformers==5.15.1
+datasets==5.0.1
+accelerate==1.14.0
+huggingface-hub==1.28.0
+safetensors==0.8.0
+sentencepiece==0.2.2

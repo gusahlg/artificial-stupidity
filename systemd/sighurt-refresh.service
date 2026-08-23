@@ -1,0 +1,9 @@
+[Unit]
+Description=SuperSighurt weekly training-corpus refresh
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/artificial-stupidity
+ExecStart=%h/artificial-stupidity/scripts/refresh_corpus.sh
+StandardOutput=journal
+StandardError=journal

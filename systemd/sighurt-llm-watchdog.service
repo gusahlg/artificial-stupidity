@@ -1,0 +1,8 @@
+[Unit]
+Description=Probe SuperSighurt generation and restart it if the GPU context died
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/artificial-stupidity
+ExecStart=%h/artificial-stupidity/scripts/watchdog_probe.sh
+EnvironmentFile=%h/.config/sighurt-llm.env

@@ -1,0 +1,6 @@
+[Unit]
+Description=Restart SuperSighurt after an atomic model promotion
+
+[Service]
+Type=oneshot
+ExecStart=systemctl --user restart sighurt-llm.service
