@@ -204,7 +204,7 @@ def main() -> None:
         [discord_train_raw, aux_train_raw],
         [discord_validation_raw, aux_validation_raw],
     )
-    if len(discord_train_raw) < 60_000 or len(discord_validation_raw) < 3_500:
+    if len(discord_train_raw) < 50_000 or len(discord_validation_raw) < 2_500:
         raise RuntimeError("Discord corpus is smaller than its audited floor")
     aux_counts = Counter(str(row["source"]) for row in aux_train_raw)
     minimums = {

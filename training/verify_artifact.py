@@ -195,7 +195,10 @@ def verify(
         "Discord does not dominate training exposure",
     )
     require(
-        int(data.get("discord_train_encoded_unique", 0)) >= 60_000,
+        # Floor lowered from 60k after the pipeline stopped training on the
+        # bot's own degenerate archived output and started dropping word-salad
+        # turns: ~57k cleaner examples now, quality over raw count.
+        int(data.get("discord_train_encoded_unique", 0)) >= 50_000,
         "too few unique Discord examples",
     )
     require(
@@ -228,8 +231,8 @@ def verify(
     require(auxiliary.get("format_version") == 1, "unsupported auxiliary corpus manifest")
     require(discord.get("system_prompt_sha256") == system_hash, "Discord prompt hash mismatch")
     require(auxiliary.get("system_prompt_sha256") == system_hash, "aux prompt hash mismatch")
-    require(int(discord.get("train_examples", 0)) >= 60_000, "Discord manifest too small")
-    require(int(discord.get("validation_examples", 0)) >= 3_500, "Discord validation too small")
+    require(int(discord.get("train_examples", 0)) >= 50_000, "Discord manifest too small")
+    require(int(discord.get("validation_examples", 0)) >= 2_500, "Discord validation too small")
     require(
         discord.get("exact_duplicate_examples_remaining") == 0,
         "Discord corpus still contains exact duplicate chats",

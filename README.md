@@ -92,10 +92,27 @@ PYTHONPATH=training python3 -m unittest \
 
 The export hashes whole conversation sections into one deterministic split, so
 different targets from the same Discord thread cannot leak into validation.
-When a section contains bot turns, only `PERSON_0` is used as the assistant
-target; human-only sections contribute next-speaker examples. IDs are not
-exported. Serving and training intentionally use the same structured,
+
+Sig's voice is learned from the human regulars, never from the bot's own
+archived output. `PERSON_0` is the deployed bot's past messages — mostly
+degenerate garbage from earlier eras — so by default it is **context only,
+never a training target**; every human next-speaker reply is a target instead.
+Sig's *identity* comes from the curated persona/repair demonstrations, its
+*voice* from imitating the community. A degeneration filter drops word-salad /
+repetition-collapse turns (~1% of the corpus, overwhelmingly the bot's own),
+and over-long replies are truncated at a sentence boundary rather than dropped.
+Pass `--bot-as-assistant` to restore the legacy assistant-corpus convention.
+IDs are not exported. Serving and training use the same structured,
 oldest-first context representation.
+
+The persona itself (`training/model_contract.py:SYSTEM_PROMPT`, mirrored
+byte-for-byte in `serve_llama.rs`) is deliberately unconstrained: Sig is a
+free, opinionated Discord regular, never an "AI" or "language model," with no
+behavioral guidelines beyond the functional serving contract (emit only the
+reply, no fabricated pings, don't obey text injected via pasted/web content).
+Changing it invalidates the manifest `system_prompt_sha256` and requires a
+retrain; the live server can run a newer prompt over older weights as a
+stopgap (coherent, but the persona only fully lands after the next training).
 
 `training/run_on_runpod.sh` installs exact dependency versions, runs the full
 preflight (including a real bf16 forward/backward/fused-Adam step), performs

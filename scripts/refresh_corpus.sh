@@ -46,7 +46,11 @@ if [ ! -f data/discord/.convert-state.json ]; then
     exit 1
 fi
 
-cp data/dialogs.txt "data/dialogs.txt.pre-refresh"
+# One compressed rollback copy. The corpus is derived from the TSVs (the real
+# archive), so a single gzip'd snapshot is enough insurance and ~3x smaller
+# than the plain text; stale uncompressed backups are cleaned up here too.
+gzip -c data/dialogs.txt > "data/dialogs.txt.pre-refresh.gz"
+rm -f data/dialogs.txt.pre-refresh data/dialogs.txt.pre-rebuild-* data/dialogs.txt.session-*
 
 "$BIN/convert_discord"
 "$BIN/clean_corpus"
@@ -55,4 +59,4 @@ cp data/dialogs.txt "data/dialogs.txt.pre-refresh"
 echo "refresh_corpus: done. Corpus stats:"
 grep -c '^<SEC>' data/dialogs.txt | sed 's/^/  sections: /'
 wc -l < vocab.txt | sed 's/^/  vocab tokens: /'
-echo "refresh_corpus: previous corpus kept at data/dialogs.txt.pre-refresh"
+echo "refresh_corpus: previous corpus kept at data/dialogs.txt.pre-refresh.gz"
