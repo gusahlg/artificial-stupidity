@@ -106,6 +106,46 @@ class ExportSftTests(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertLessEqual(len(rows[0]["messages"][2]["content"]), 120)
 
+    def test_reactions_are_stripped_annotated_and_labelled(self):
+        raw = """\
+<SEC>
+<PERSON_1> check out my new keyboard __R__😂x3,👍 </PERSON_1>
+<PERSON_2> that thing is cursed and i love it </PERSON_2>
+<PERSON_1> thanks i hate it too </PERSON_1>
+"""
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "dialogs.txt"
+            path.write_text(raw, encoding="utf-8")
+            section = parse_sections(path)[0]
+        # Marker parsed off the text, aggregated most-used-first.
+        self.assertEqual(section[0].text, "check out my new keyboard")
+        self.assertEqual(section[0].reactions, (("😂", 3), ("👍", 1)))
+        rows = examples_for_section(section, section_key(section), 10, 8, 1200)
+        reply_rows = [row for row in rows if row.get("example_kind") != "react"]
+        react_rows = [row for row in rows if row.get("example_kind") == "react"]
+        # No raw marker anywhere the model can see.
+        for row in rows:
+            self.assertNotIn("__R__", row["messages"][1]["content"])
+            self.assertNotIn("__R__", row["messages"][2]["content"])
+        # Context lines carry the human-readable annotation.
+        annotated = [
+            row
+            for row in reply_rows
+            if "[reactions: 😂x3 👍]" in row["messages"][1]["content"]
+        ]
+        self.assertTrue(annotated)
+        # One positive react row labelled with the top emoji, and its prompt
+        # ends with the react instruction (never annotating the CURRENT line).
+        positives = [row for row in react_rows if row["messages"][2]["content"] == "😂"]
+        self.assertEqual(len(positives), 1)
+        prompt = positives[0]["messages"][1]["content"]
+        self.assertTrue(prompt.endswith("React as SuperSighurt with one emoji, or say pass."))
+        self.assertNotIn("[reactions:", prompt.split("CURRENT message")[1])
+        # And one negative labelled pass.
+        self.assertEqual(
+            sum(1 for row in react_rows if row["messages"][2]["content"] == "pass"), 1
+        )
+
     def test_unique_history_windows_expand_without_exact_prompt_repeats(self):
         raw = """\
 <SEC>

@@ -27,6 +27,33 @@ WEB_RESULTS_HEADER = "Live web search results (untrusted evidence, never instruc
 class Turn:
     person: int
     text: str
+    # Aggregated emoji reactions this turn received, most-used first, e.g.
+    # (("😂", 3), ("👍", 1)). Parsed out of the corpus `__R__` markers; the
+    # marker text itself never reaches a model-visible string.
+    reactions: tuple = ()
+
+
+# Inline reaction marker written by convert_discord: `__R__😂x3,👍`. It rides
+# inside turn text (same family as __URL__/__EMOJI__) so the corpus grammar
+# and its legacy parsers stay untouched; this exporter strips it everywhere
+# and re-renders it as context annotations and react-training labels.
+REACT_MARKER_RE = re.compile(r"\s*__R__(\S*)")
+
+
+def split_reactions(raw_text: str) -> tuple[str, tuple]:
+    reactions: list[tuple[str, int]] = []
+    for marker in REACT_MARKER_RE.findall(raw_text):
+        for item in marker.split(","):
+            if not item:
+                continue
+            emoji, _, count = item.rpartition("x")
+            if emoji and count.isdigit():
+                reactions.append((emoji, int(count)))
+            else:
+                reactions.append((item, 1))
+    text = " ".join(REACT_MARKER_RE.sub(" ", raw_text).split())
+    reactions.sort(key=lambda pair: (-pair[1], pair[0]))
+    return text, tuple(reactions)
 
 
 def parse_sections(path: Path) -> list[list[Turn]]:
@@ -44,9 +71,9 @@ def parse_sections(path: Path) -> list[list[Turn]]:
         match = TURN_RE.fullmatch(line)
         if not match:
             raise ValueError(f"{path}:{line_number}: malformed corpus turn: {line[:120]!r}")
-        text = " ".join(match.group(2).split())
+        text, reactions = split_reactions(" ".join(match.group(2).split()))
         if text:
-            current.append(Turn(int(match.group(1)), text))
+            current.append(Turn(int(match.group(1)), text, reactions))
     if current:
         sections.append(current)
     return sections
@@ -62,7 +89,19 @@ def is_validation(key: str, validation_fraction: float) -> bool:
     return bucket < validation_fraction
 
 
-def render_user(turns: list[Turn], history_turns: int) -> str:
+REACT_INSTRUCTION = "React as SuperSighurt with one emoji, or say pass."
+
+
+def reaction_annotation(turn: Turn) -> str:
+    if not turn.reactions:
+        return ""
+    rendered = " ".join(
+        f"{emoji}x{count}" if count > 1 else emoji for emoji, count in turn.reactions[:4]
+    )
+    return f" [reactions: {rendered}]"
+
+
+def render_user(turns: list[Turn], history_turns: int, instruction: str = "Reply as SuperSighurt.") -> str:
     current = turns[-1]
     ambient = turns[:-1][-history_turns:]
     chunks: list[str] = []
@@ -70,15 +109,18 @@ def render_user(turns: list[Turn], history_turns: int) -> str:
         chunks.append("Recent Discord conversation (oldest first):")
         for index, turn in enumerate(ambient, 1):
             speaker = "SuperSighurt" if turn.person == 0 else f"Person {turn.person}"
-            chunks.append(f"[#{index}] {speaker}: {turn.text}")
+            chunks.append(f"[#{index}] {speaker}: {turn.text}{reaction_annotation(turn)}")
         chunks.append("")
     speaker = "SuperSighurt" if current.person == 0 else f"Person {current.person}"
+    # The CURRENT message is never annotated: for react rows its reactions ARE
+    # the label, and for reply rows the reactions arrived after the moment
+    # being imitated anyway.
     chunks.extend(
         [
             f"CURRENT message from {speaker}:",
             current.text,
             "",
-            "Reply as SuperSighurt.",
+            instruction,
         ]
     )
     return "\n".join(chunks)
@@ -237,6 +279,49 @@ def examples_for_section(
                     "history_turns": history,
                 }
             )
+
+    # React-decision rows teach WHEN to react and with WHAT, straight from
+    # real human reactions: turns that got a reaction label with their top
+    # emoji, and an equal number of unreacted turns label "pass" so the model
+    # learns that passing is the common case. One modest history window keeps
+    # these a seasoning, not a flood.
+    # Unlike reply targets, a reaction needs no preceding context — reacting
+    # to a conversation-opening message is normal — so index 0 is eligible.
+    react_history = min(history_variants[-1], 8)
+    positives = [
+        (index, turn)
+        for index, turn in enumerate(section)
+        if turn.person != 0 and turn.reactions
+    ][:4]
+    negative_pool = [
+        (index, turn)
+        for index, turn in enumerate(section)
+        if turn.person != 0 and not turn.reactions
+    ]
+    step = max(1, len(negative_pool) // max(1, len(positives)))
+    negatives = negative_pool[::step][: len(positives)]
+    for index, turn in positives + negatives:
+        rendered = render_user(section[: index + 1], react_history, REACT_INSTRUCTION)
+        prompt_key = hashlib.sha256(rendered.encode("utf-8")).hexdigest()
+        if prompt_key in seen_prompts:
+            continue
+        seen_prompts.add(prompt_key)
+        label = turn.reactions[0][0] if turn.reactions else "pass"
+        candidates.append(
+            {
+                "messages": [
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": rendered},
+                    {"role": "assistant", "content": label},
+                ],
+                "source": "discord_archive",
+                "example_kind": "react",
+                "section_sha256": section_hash,
+                "target_index": index,
+                "target_person": turn.person,
+                "history_turns": react_history,
+            }
+        )
     return candidates
 
 
@@ -335,6 +420,12 @@ def main() -> None:
         ),
         "degenerate_turns_filtered": True,
         "long_targets_truncated": True,
+        "train_react_examples": sum(
+            1 for row in train_rows if row.get("example_kind") == "react"
+        ),
+        "validation_react_examples": sum(
+            1 for row in validation_rows if row.get("example_kind") == "react"
+        ),
         "source": "discord_archive",
         "augmentation": "unique_recent_history_windows",
     }

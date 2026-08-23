@@ -105,6 +105,16 @@ Pass `--bot-as-assistant` to restore the legacy assistant-corpus convention.
 IDs are not exported. Serving and training use the same structured,
 oldest-first context representation.
 
+Reactions ride the same pipeline: the bot logs every human ReactionAdd/Remove
+to a per-channel `<channel>.reactions.tsv`, `convert_discord` folds net counts
+into inline `__R__😂x3,👍` markers on the reacted turn (no corpus-grammar
+change, legacy parsers unaffected), and `export_sft.py` strips the markers
+from all model-visible text, annotates context lines as `[reactions: …]`, and
+emits react-decision rows — real reacted messages labelled with their top
+emoji plus matched unreacted ones labelled `pass`, under the same instruction
+the server renders for the bot's live `mode: "react"` requests. That is how
+the next retrain learns when (and how) Sig should react on its own.
+
 The persona itself (`training/model_contract.py:SYSTEM_PROMPT`, mirrored
 byte-for-byte in `serve_llama.rs`) is deliberately unconstrained: Sig is a
 free, opinionated Discord regular, never an "AI" or "language model," with no

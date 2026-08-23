@@ -77,6 +77,11 @@ struct InferenceRequest {
     reply_to: Option<ReplyTarget>,
     web_search_query: Option<String>,
     web_results: Vec<WebResult>,
+    /// Reaction mode: the prompt asks for a single emoji (or "pass") instead
+    /// of a chat reply, and generation is capped short. The rendered
+    /// instruction must stay byte-identical to the react rows that
+    /// training/export_sft.py emits, or the trained behavior won't transfer.
+    react: bool,
 }
 
 struct InferenceJob {
@@ -225,7 +230,14 @@ impl LlamaRuntime {
         // full sequence) breaks that cross-turn spiral.
         let mut recent_stream = prompt_ids.clone();
         let mut generated = Vec::<u32>::new();
-        for _ in 0..self.sampling.max_new_tokens {
+        // A reaction is one emoji or the word "pass" — a dozen tokens covers
+        // any of them and keeps react traffic cheap on the GPU.
+        let token_budget = if request.react {
+            self.sampling.max_new_tokens.min(12)
+        } else {
+            self.sampling.max_new_tokens
+        };
+        for _ in 0..token_budget {
             let token = sample_logits(&logits, &recent_stream, &self.sampling)?;
             if self.eos_ids.contains(&token) || self.role_stop_ids.contains(&token) {
                 break;
@@ -505,8 +517,16 @@ fn render_prompt(request: &InferenceRequest) -> String {
     } else {
         request.user.clone()
     };
+    // Reaction mode swaps only the final instruction line; everything else in
+    // the rendering is shared with the reply path, and export_sft.py emits
+    // training rows with this exact wording.
+    let instruction = if request.react {
+        "React as SuperSighurt with one emoji, or say pass."
+    } else {
+        "Reply as SuperSighurt."
+    };
     user_body.push_str(&format!(
-        "CURRENT message from {current_user}{current_reply_marker}:\n{}\n\nReply as SuperSighurt.",
+        "CURRENT message from {current_user}{current_reply_marker}:\n{}\n\n{instruction}",
         request.input,
     ));
 
@@ -630,6 +650,7 @@ fn parse_request(value: &Value) -> Result<InferenceRequest> {
         reply_to,
         web_search_query,
         web_results,
+        react: field_str(value, "mode").as_deref() == Some("react"),
     })
 }
 
@@ -801,6 +822,7 @@ fn check_request() -> InferenceRequest {
         reply_to: None,
         web_search_query: None,
         web_results: Vec::new(),
+        react: false,
     }
 }
 
@@ -969,6 +991,7 @@ mod tests {
             }),
             web_search_query: None,
             web_results: Vec::new(),
+            react: false,
         }
     }
 

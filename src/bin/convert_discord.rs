@@ -462,8 +462,80 @@ fn collect_tsv_paths(root: &str) -> Result<Vec<PathBuf>> {
     Ok(out)
 }
 
+/// Aggregate the sidecar `<channel>.reactions.tsv` (written by the bot's
+/// reaction logger) into net per-message emoji counts.
+///
+/// Row format: `message_id \t timestamp \t user_id \t emoji \t delta`. Live
+/// gateway rows carry a real user id and ±1 deltas (add/remove churn cancels
+/// per user); scraper-summarized rows carry `user_id = 0` and an absolute
+/// count. Missing file = no reactions, silently.
+fn load_reactions(tsv_path: &Path) -> HashMap<u64, Vec<(String, i64)>> {
+    let path = tsv_path.with_extension("reactions.tsv");
+    let Ok(raw) = fs::read_to_string(&path) else {
+        return HashMap::new();
+    };
+    // (message, emoji, user) -> net delta for live rows; user 0 aggregates.
+    let mut per_user: HashMap<(u64, String, u64), i64> = HashMap::new();
+    for line in raw.lines() {
+        let parts: Vec<&str> = line.split('\t').collect();
+        if parts.len() < 5 {
+            continue;
+        }
+        let (Ok(message_id), Ok(user_id), Ok(delta)) = (
+            parts[0].parse::<u64>(),
+            parts[2].parse::<u64>(),
+            parts[4].parse::<i64>(),
+        ) else {
+            continue;
+        };
+        let emoji = unescape_tsv(parts[3]);
+        if emoji.trim().is_empty() {
+            continue;
+        }
+        *per_user.entry((message_id, emoji, user_id)).or_default() += delta;
+    }
+    let mut counts: HashMap<u64, HashMap<String, i64>> = HashMap::new();
+    for ((message_id, emoji, user_id), net) in per_user {
+        let add = if user_id == 0 { net } else { i64::from(net > 0) };
+        if add > 0 {
+            *counts.entry(message_id).or_default().entry(emoji).or_default() += add;
+        }
+    }
+    counts
+        .into_iter()
+        .map(|(message_id, emojis)| {
+            let mut list: Vec<(String, i64)> = emojis.into_iter().collect();
+            // Most-used first; emoji text as the deterministic tiebreak.
+            list.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+            (message_id, list)
+        })
+        .collect()
+}
+
+/// Render aggregated reactions as an inline corpus marker: `__R__😂x3,👍`.
+/// It rides inside the turn text (same family as `__URL__`/`__EMOJI__`), so
+/// no corpus-grammar change and no legacy parser breaks; export_sft.py strips
+/// it from all model-visible text and re-renders it as context annotations
+/// and react-training labels.
+fn reaction_marker(reactions: &[(String, i64)]) -> String {
+    let items = reactions
+        .iter()
+        .take(4)
+        .map(|(emoji, count)| {
+            if *count > 1 {
+                format!("{emoji}x{count}")
+            } else {
+                emoji.clone()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("__R__{items}")
+}
+
 fn parse_tsv(path: &Path) -> Result<Vec<Msg>> {
     let raw = fs::read_to_string(path)?;
+    let reactions = load_reactions(path);
     let mut out = Vec::new();
     let mut seen: HashSet<u64> = HashSet::new();
     for (n, line) in raw.lines().enumerate() {
@@ -494,7 +566,13 @@ fn parse_tsv(path: &Path) -> Result<Vec<Msg>> {
         };
         let display_name = parts[3].to_string();
         let reply_to: Option<u64> = parts[4].parse().ok();
-        let content = unescape_tsv(parts[5..].join("\t").as_str());
+        let mut content = unescape_tsv(parts[5..].join("\t").as_str());
+        if let Some(reaction_list) = reactions.get(&id) {
+            if !content.trim().is_empty() {
+                content.push(' ');
+                content.push_str(&reaction_marker(reaction_list));
+            }
+        }
         out.push(Msg {
             id,
             ts_secs,
@@ -875,6 +953,34 @@ mod tests {
 
     fn no_names() -> HashMap<u64, String> {
         HashMap::new()
+    }
+
+    #[test]
+    fn reactions_aggregate_net_counts_and_render_marker() {
+        let dir = std::env::temp_dir().join(format!("convert-react-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let tsv = dir.join("777.tsv");
+        std::fs::write(&tsv, "").unwrap();
+        // user 5 adds then removes 😂 (nets out); users 6+7 add 😂; user 6
+        // adds 👍; a scraper summary row adds 2 more 👍 with user_id 0.
+        std::fs::write(
+            dir.join("777.reactions.tsv"),
+            "10\t2026-01-01T00:00:00Z\t5\t😂\t1\n\
+             10\t2026-01-01T00:00:01Z\t5\t😂\t-1\n\
+             10\t2026-01-01T00:00:02Z\t6\t😂\t1\n\
+             10\t2026-01-01T00:00:03Z\t7\t😂\t1\n\
+             10\t2026-01-01T00:00:04Z\t6\t👍\t1\n\
+             10\t2026-01-01T00:00:05Z\t0\t👍\t2\n",
+        )
+        .unwrap();
+        let reactions = load_reactions(&tsv);
+        let list = reactions.get(&10).unwrap();
+        assert_eq!(list.len(), 2);
+        // 👍 nets 3 (1 live + 2 scraped), 😂 nets 2 (user 5 cancelled out).
+        assert_eq!(list[0], ("👍".to_string(), 3));
+        assert_eq!(list[1], ("😂".to_string(), 2));
+        assert_eq!(reaction_marker(list), "__R__👍x3,😂x2");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
